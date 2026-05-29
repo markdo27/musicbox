@@ -18,6 +18,20 @@ const AudioEngine = (() => {
   // Active oscillator voices for note-offs
   const activeVoices = new Map(); // key: `ch-note` → {osc, env, ...}
 
+  // Spatial FX nodes and gains
+  let reverbNode = null;
+  let delayNode = null;
+  let dryGain = null;
+  let reverbWetGain = null;
+  let delayWetGain = null;
+
+  // Spatial FX defaults
+  let reverbMixVal = 0.25;
+  let reverbDecayVal = 2.5; // seconds
+  let delayMixVal = 0.2;
+  let delayTimeVal = 0.35; // seconds
+  let delayFeedbackVal = 0.45;
+
   // Per-track instrument settings (index = track index)
   const trackInstruments = [
     { type: 'drum',  color: '#00d4ff' },
@@ -37,10 +51,13 @@ const AudioEngine = (() => {
     channelInstrumentMap.set(i, i === 10 ? 'drum' : 'synth');
   }
 
-  // ─── Init Audio Context ─────────────────────────────────────
   function init() {
     if (ctx) return;
     ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+    if (window.SamplerEngine) {
+      SamplerEngine.init();
+    }
 
     // Master compressor (prevents clipping)
     masterCompressor = ctx.createDynamicsCompressor();
@@ -54,7 +71,28 @@ const AudioEngine = (() => {
     // Master gain
     masterGain = ctx.createGain();
     masterGain.gain.setValueAtTime(masterVol, ctx.currentTime);
-    masterGain.connect(masterCompressor);
+
+    // Dry path
+    dryGain = ctx.createGain();
+    dryGain.gain.setValueAtTime(Math.max(0.1, 1.0 - reverbMixVal * 0.7 - delayMixVal * 0.7), ctx.currentTime);
+    masterGain.connect(dryGain);
+    dryGain.connect(masterCompressor);
+
+    // Delay path
+    delayNode = _createPingPongDelay(ctx, delayTimeVal, delayFeedbackVal);
+    delayWetGain = ctx.createGain();
+    delayWetGain.gain.setValueAtTime(delayMixVal, ctx.currentTime);
+    masterGain.connect(delayNode.input);
+    delayNode.output.connect(delayWetGain);
+    delayWetGain.connect(masterCompressor);
+
+    // Reverb path
+    reverbNode = _createReverb(ctx, reverbDecayVal);
+    reverbWetGain = ctx.createGain();
+    reverbWetGain.gain.setValueAtTime(reverbMixVal, ctx.currentTime);
+    masterGain.connect(reverbNode.input);
+    reverbNode.output.connect(reverbWetGain);
+    reverbWetGain.connect(masterCompressor);
   }
 
   function resume() {
@@ -68,6 +106,12 @@ const AudioEngine = (() => {
 
     const vel = (velocity || 100) / 127;
     const instrType = _getInstrType(channel, trackIdx);
+
+    // External Sampler Check (Strudel database)
+    if (window.SamplerEngine && SamplerEngine.getCategories().includes(instrType)) {
+      SamplerEngine.playSample(ctx, masterGain, instrType, note, vel, 0);
+      return;
+    }
 
     if (instrType === 'drum' || channel === 10) {
       _playDrum(note, vel);
@@ -103,8 +147,8 @@ const AudioEngine = (() => {
   }
 
   function _getInstrType(channel, trackIdx) {
-    if (channel === 10) return 'drum';
     if (trackIdx >= 0 && trackInstruments[trackIdx]) return trackInstruments[trackIdx].type;
+    if (channel === 10) return 'drum';
     return 'synth';
   }
 
@@ -480,7 +524,8 @@ const AudioEngine = (() => {
 
     // Auto note-off for drums (they self-decay)
     // For synths, schedule note-off based on gate
-    if (instrType !== 'drum' && channel !== 10) {
+    const isSampler = window.SamplerEngine && SamplerEngine.getCategories().includes(instrType);
+    if (instrType !== 'drum' && !isSampler) {
       setTimeout(() => noteOff(channel, note), gateSec * 1000);
     }
   }
@@ -518,6 +563,155 @@ const AudioEngine = (() => {
     activeVoices.clear();
   }
 
+  // ─── Spatial FX Helpers ─────────────────────────────────────
+  function _createReverb(ctx, decayTime) {
+    const input = ctx.createGain();
+    const output = ctx.createGain();
+
+    const combDelays = [0.029, 0.037, 0.041, 0.043];
+    const combGains = [0.742, 0.733, 0.715, 0.697];
+    const combs = combDelays.map((d, i) => {
+      const delay = ctx.createDelay();
+      delay.delayTime.value = d;
+      const feedback = ctx.createGain();
+      const fbVal = Math.min(0.95, Math.pow(combGains[i], decayTime));
+      feedback.gain.value = fbVal;
+      
+      delay.connect(feedback);
+      feedback.connect(delay);
+      return { delay, feedback };
+    });
+
+    const apDelays = [0.005, 0.0017];
+    const apGains = [0.7, 0.7];
+    const allpasses = apDelays.map((d, i) => {
+      const ap = ctx.createBiquadFilter();
+      ap.type = 'allpass';
+      ap.frequency.value = 1 / d;
+      ap.Q.value = apGains[i];
+      return ap;
+    });
+
+    combs.forEach(c => {
+      input.connect(c.delay);
+      c.delay.connect(allpasses[0]);
+    });
+
+    allpasses[0].connect(allpasses[1]);
+    allpasses[1].connect(output);
+
+    return {
+      input,
+      output,
+      setDecay: (val) => {
+        combs.forEach((c, i) => {
+          const fbVal = Math.min(0.95, Math.pow(combGains[i], val));
+          c.feedback.gain.setTargetAtTime(fbVal, ctx.currentTime, 0.05);
+        });
+      }
+    };
+  }
+
+  function _createPingPongDelay(ctx, delayTime, feedbackVal) {
+    const splitter = ctx.createChannelSplitter(2);
+    const merger = ctx.createChannelMerger(2);
+
+    const delayL = ctx.createDelay(2.0);
+    const delayR = ctx.createDelay(2.0);
+
+    const fbL = ctx.createGain();
+    const fbR = ctx.createGain();
+
+    const input = ctx.createGain();
+    const output = ctx.createGain();
+
+    delayL.delayTime.setValueAtTime(delayTime, ctx.currentTime);
+    delayR.delayTime.setValueAtTime(delayTime * 1.5, ctx.currentTime);
+
+    fbL.gain.setValueAtTime(feedbackVal, ctx.currentTime);
+    fbR.gain.setValueAtTime(feedbackVal, ctx.currentTime);
+
+    const filterL = ctx.createBiquadFilter();
+    const filterR = ctx.createBiquadFilter();
+    filterL.type = 'lowpass';
+    filterR.type = 'lowpass';
+    filterL.frequency.value = 2200;
+    filterR.frequency.value = 2200;
+
+    input.connect(delayL);
+    input.connect(delayR);
+
+    delayL.connect(filterL);
+    filterL.connect(fbL);
+    fbL.connect(delayR);
+
+    delayR.connect(filterR);
+    filterR.connect(fbR);
+    fbR.connect(delayL);
+
+    delayL.connect(merger, 0, 0);
+    delayR.connect(merger, 0, 1);
+
+    merger.connect(output);
+
+    return {
+      input,
+      output,
+      setDelayTime: (val) => {
+        delayL.delayTime.setTargetAtTime(val, ctx.currentTime, 0.1);
+        delayR.delayTime.setTargetAtTime(val * 1.5, ctx.currentTime, 0.1);
+      },
+      setFeedback: (val) => {
+        fbL.gain.setTargetAtTime(val, ctx.currentTime, 0.05);
+        fbR.gain.setTargetAtTime(val, ctx.currentTime, 0.05);
+      }
+    };
+  }
+
+  function setReverbMix(mix) {
+    reverbMixVal = mix;
+    if (reverbWetGain && ctx) {
+      reverbWetGain.gain.setTargetAtTime(mix, ctx.currentTime, 0.02);
+      _updateDryGain();
+    }
+  }
+
+  function setReverbDecay(decay) {
+    reverbDecayVal = decay;
+    if (reverbNode) {
+      reverbNode.setDecay(decay);
+    }
+  }
+
+  function setDelayMix(mix) {
+    delayMixVal = mix;
+    if (delayWetGain && ctx) {
+      delayWetGain.gain.setTargetAtTime(mix, ctx.currentTime, 0.02);
+      _updateDryGain();
+    }
+  }
+
+  function setDelayTime(time) {
+    delayTimeVal = time;
+    if (delayNode) {
+      delayNode.setDelayTime(time);
+    }
+  }
+
+  function setDelayFeedback(fb) {
+    delayFeedbackVal = fb;
+    if (delayNode) {
+      delayNode.setFeedback(fb);
+    }
+  }
+
+  function _updateDryGain() {
+    if (dryGain && ctx) {
+      const dryVal = Math.max(0.1, 1.0 - reverbMixVal * 0.7 - delayMixVal * 0.7);
+      dryGain.gain.setTargetAtTime(dryVal, ctx.currentTime, 0.02);
+    }
+  }
+
   return {
     init,
     resume,
@@ -530,6 +724,11 @@ const AudioEngine = (() => {
     setMasterVolume,
     setTrackInstrument,
     getTrackInstruments,
+    setReverbMix,
+    setReverbDecay,
+    setDelayMix,
+    setDelayTime,
+    setDelayFeedback,
   };
 
 })();

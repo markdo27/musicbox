@@ -25,6 +25,7 @@ const Storage = (() => {
         volume: t.volume,
         steps: t.steps.map(s => ({ ...s })),
       })),
+      instruments: window.AudioEngine ? AudioEngine.getTrackInstruments().map(i => i.type) : [],
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(project));
@@ -55,6 +56,14 @@ const Storage = (() => {
     // Set step count without triggering full rebuild (will be done by initTracks)
     Sequencer.getState().stepCount = project.stepCount || 16;
     Sequencer.initTracks(project.tracks || []);
+    if (project.instruments && window.AudioEngine) {
+      project.instruments.forEach((type, idx) => {
+        AudioEngine.setTrackInstrument(idx, type);
+      });
+      if (window.UI && UI.renderInstruments) {
+        UI.renderInstruments();
+      }
+    }
     return true;
   }
 
@@ -75,6 +84,7 @@ const Storage = (() => {
         volume: t.volume,
         steps: t.steps.map(s => ({ ...s })),
       })),
+      instruments: window.AudioEngine ? AudioEngine.getTrackInstruments().map(i => i.type) : [],
     };
 
     const blob = new Blob([JSON.stringify(project, null, 2)], { type: 'application/json' });

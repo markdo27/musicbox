@@ -88,6 +88,9 @@
 
   // ─── Audio Engine Init ────────────────────────────────────────
   // AudioEngine lazy-inits on first note; just render the instrument panel now
+  if (window.SamplerEngine) {
+    await SamplerEngine.init();
+  }
   UI.renderInstruments();
 
   // Audio toggle button
@@ -103,6 +106,36 @@
   // Master volume slider
   document.getElementById('master-vol').addEventListener('input', (e) => {
     AudioEngine.setMasterVolume(parseInt(e.target.value) / 100);
+  });
+
+  // Spatial FX UI bindings
+  document.getElementById('fx-reverb-mix').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value);
+    document.getElementById('fx-reverb-mix-val').textContent = val + '%';
+    AudioEngine.setReverbMix(val / 100);
+  });
+
+  document.getElementById('fx-reverb-decay').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value) / 10;
+    document.getElementById('fx-reverb-decay-val').textContent = val.toFixed(1) + 's';
+    AudioEngine.setReverbDecay(val);
+  });
+
+  document.getElementById('fx-delay-mix').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value);
+    document.getElementById('fx-delay-mix-val').textContent = val + '%';
+    AudioEngine.setDelayMix(val / 100);
+  });
+
+  document.getElementById('fx-delay-time').addEventListener('change', (e) => {
+    const val = parseFloat(e.target.value);
+    AudioEngine.setDelayTime(val);
+  });
+
+  document.getElementById('fx-delay-feedback').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value);
+    document.getElementById('fx-delay-feedback-val').textContent = val + '%';
+    AudioEngine.setDelayFeedback(val / 100);
   });
 
 

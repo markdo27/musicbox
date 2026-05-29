@@ -553,9 +553,22 @@ const UI = (() => {
       row.className = 'instr-row';
       row.id = `instr-row-${trackIdx}`;
 
-      const options = INSTRUMENT_TYPES.map(t =>
+      let options = `<optgroup label="Internal Synths">`;
+      options += INSTRUMENT_TYPES.map(t =>
         `<option value="${t.id}" ${instr.type === t.id ? 'selected' : ''}>${t.icon} ${t.label}</option>`
       ).join('');
+      options += `</optgroup>`;
+
+      if (window.SamplerEngine) {
+        const cats = SamplerEngine.getCategories();
+        if (cats.length > 0) {
+          options += `<optgroup label="Strudel Samples">`;
+          options += cats.map(c => 
+            `<option value="${c}" ${instr.type === c ? 'selected' : ''}>📁 ${c}</option>`
+          ).join('');
+          options += `</optgroup>`;
+        }
+      }
 
       row.innerHTML = `
         <div class="instr-color-dot" style="background:${color.css}"></div>
@@ -571,6 +584,29 @@ const UI = (() => {
 
       container.appendChild(row);
     });
+  }
+
+  function syncSpatialSliders(fx) {
+    if (!fx) return;
+    if (fx.reverbMix !== undefined) {
+      document.getElementById('fx-reverb-mix').value = Math.round(fx.reverbMix * 100);
+      document.getElementById('fx-reverb-mix-val').textContent = Math.round(fx.reverbMix * 100) + '%';
+    }
+    if (fx.reverbDecay !== undefined) {
+      document.getElementById('fx-reverb-decay').value = Math.round(fx.reverbDecay * 10);
+      document.getElementById('fx-reverb-decay-val').textContent = fx.reverbDecay.toFixed(1) + 's';
+    }
+    if (fx.delayMix !== undefined) {
+      document.getElementById('fx-delay-mix').value = Math.round(fx.delayMix * 100);
+      document.getElementById('fx-delay-mix-val').textContent = Math.round(fx.delayMix * 100) + '%';
+    }
+    if (fx.delayTime !== undefined) {
+      document.getElementById('fx-delay-time').value = fx.delayTime;
+    }
+    if (fx.delayFeedback !== undefined) {
+      document.getElementById('fx-delay-feedback').value = Math.round(fx.delayFeedback * 100);
+      document.getElementById('fx-delay-feedback-val').textContent = Math.round(fx.delayFeedback * 100) + '%';
+    }
   }
 
   // ─── Utility ──────────────────────────────────────────────────
@@ -592,6 +628,7 @@ const UI = (() => {
     openNotePicker,
     closeNotePicker,
     TRACK_COLORS,
+    syncSpatialSliders,
   };
 
 })();

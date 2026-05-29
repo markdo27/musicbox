@@ -135,6 +135,43 @@
         </div>
       </section>
 
+      <!-- Spatial FX Controls -->
+      <section class="panel" id="panel-spatial-fx">
+        <h2 class="panel-title"><span class="panel-icon">🌌</span> SPATIAL FX</h2>
+        <div class="spatial-fx-controls">
+          <div class="fx-row">
+            <span class="fx-label">Reverb Mix</span>
+            <input type="range" class="fx-slider" id="fx-reverb-mix" min="0" max="100" value="25" />
+            <span class="fx-val" id="fx-reverb-mix-val">25%</span>
+          </div>
+          <div class="fx-row">
+            <span class="fx-label">Reverb Space</span>
+            <input type="range" class="fx-slider" id="fx-reverb-decay" min="10" max="80" value="25" />
+            <span class="fx-val" id="fx-reverb-decay-val">2.5s</span>
+          </div>
+          <div class="fx-row">
+            <span class="fx-label">Delay Mix</span>
+            <input type="range" class="fx-slider" id="fx-delay-mix" min="0" max="100" value="20" />
+            <span class="fx-val" id="fx-delay-mix-val">20%</span>
+          </div>
+          <div class="fx-row">
+            <span class="fx-label">Delay Time</span>
+            <select class="fx-select" id="fx-delay-time">
+              <option value="0.12">1/16 Note</option>
+              <option value="0.24">1/8 Note</option>
+              <option value="0.36" selected>1/8 Dotted</option>
+              <option value="0.48">1/4 Note</option>
+              <option value="0.72">1/4 Dotted</option>
+            </select>
+          </div>
+          <div class="fx-row">
+            <span class="fx-label">Delay Feedback</span>
+            <input type="range" class="fx-slider" id="fx-delay-feedback" min="0" max="95" value="45" />
+            <span class="fx-val" id="fx-delay-feedback-val">45%</span>
+          </div>
+        </div>
+      </section>
+
       <!-- Step Editor (context panel) -->
       <section class="panel" id="panel-step-editor">
         <h2 class="panel-title"><span class="panel-icon">✏️</span> STEP EDITOR</h2>
@@ -198,6 +235,7 @@
 
   <!-- ─── SCRIPTS ────────────────────────────────────────── -->
   <script src="js/presets.js"></script>
+  <script src="js/sampler.js"></script>
   <script src="js/audio.js"></script>
   <script src="js/midi.js"></script>
   <script src="js/sequencer.js"></script>
