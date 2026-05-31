@@ -24,6 +24,8 @@ const AudioEngine = (() => {
   let dryGain = null;
   let reverbWetGain = null;
   let delayWetGain = null;
+  let reverbToneFilter = null;
+  let delayToneFilter = null;
 
   // Spatial FX defaults
   let reverbMixVal = 0.25;
@@ -43,6 +45,9 @@ const AudioEngine = (() => {
     { type: 'pad',   color: '#7df3e1' },
     { type: 'lead',  color: '#a78bfa' },
   ];
+
+  // Per-track gain nodes (real-time Web Audio volume control)
+  const trackGainNodes = new Array(8).fill(null);
 
   // ─── Instrument type map (overridable) ──────────────────────
   const channelInstrumentMap = new Map();
@@ -72,27 +77,45 @@ const AudioEngine = (() => {
     masterGain = ctx.createGain();
     masterGain.gain.setValueAtTime(masterVol, ctx.currentTime);
 
+    // Per-track gain nodes: masterGain → trackGain[i] → master bus
+    for (let i = 0; i < 8; i++) {
+      const tg = ctx.createGain();
+      tg.gain.value = 1.0;
+      trackGainNodes[i] = tg;
+      tg.connect(masterGain);
+    }
+
     // Dry path
     dryGain = ctx.createGain();
     dryGain.gain.setValueAtTime(Math.max(0.1, 1.0 - reverbMixVal * 0.7 - delayMixVal * 0.7), ctx.currentTime);
     masterGain.connect(dryGain);
     dryGain.connect(masterCompressor);
 
-    // Delay path
+    // Delay path (with high-cut tone filter)
     delayNode = _createPingPongDelay(ctx, delayTimeVal, delayFeedbackVal);
     delayWetGain = ctx.createGain();
     delayWetGain.gain.setValueAtTime(delayMixVal, ctx.currentTime);
+    delayToneFilter = ctx.createBiquadFilter();
+    delayToneFilter.type = 'highshelf';
+    delayToneFilter.frequency.value = 4000;
+    delayToneFilter.gain.value = -6;
     masterGain.connect(delayNode.input);
     delayNode.output.connect(delayWetGain);
-    delayWetGain.connect(masterCompressor);
+    delayWetGain.connect(delayToneFilter);
+    delayToneFilter.connect(masterCompressor);
 
-    // Reverb path
+    // Reverb path (with high-cut tone filter)
     reverbNode = _createReverb(ctx, reverbDecayVal);
     reverbWetGain = ctx.createGain();
     reverbWetGain.gain.setValueAtTime(reverbMixVal, ctx.currentTime);
+    reverbToneFilter = ctx.createBiquadFilter();
+    reverbToneFilter.type = 'highshelf';
+    reverbToneFilter.frequency.value = 3000;
+    reverbToneFilter.gain.value = -9;
     masterGain.connect(reverbNode.input);
     reverbNode.output.connect(reverbWetGain);
-    reverbWetGain.connect(masterCompressor);
+    reverbWetGain.connect(reverbToneFilter);
+    reverbToneFilter.connect(masterCompressor);
   }
 
   function resume() {
@@ -107,20 +130,23 @@ const AudioEngine = (() => {
     const vel = (velocity || 100) / 127;
     const instrType = _getInstrType(channel, trackIdx);
 
+    // Resolve output bus: per-track gain if available, else master
+    const outBus = (trackIdx >= 0 && trackGainNodes[trackIdx]) ? trackGainNodes[trackIdx] : masterGain;
+
     // External Sampler Check (Strudel database)
     if (window.SamplerEngine && SamplerEngine.getCategories().includes(instrType)) {
-      SamplerEngine.playSample(ctx, masterGain, instrType, note, vel, 0);
+      SamplerEngine.playSample(ctx, outBus, instrType, note, vel, 0);
       return;
     }
 
     if (instrType === 'drum' || channel === 10) {
-      _playDrum(note, vel);
+      _playDrum(note, vel, outBus);
     } else if (instrType === 'bass') {
-      _playBass(channel, note, vel);
+      _playBass(channel, note, vel, outBus);
     } else if (instrType === 'pad') {
-      _playPad(channel, note, vel);
+      _playPad(channel, note, vel, outBus);
     } else {
-      _playSynth(channel, note, vel);
+      _playSynth(channel, note, vel, outBus);
     }
   }
 
@@ -171,27 +197,28 @@ const AudioEngine = (() => {
     70: 'clap', 75: 'clap',
   };
 
-  function _playDrum(note, vel) {
+  function _playDrum(note, vel, outBus) {
     const type = DRUM_MAP[note] || (note % 2 === 0 ? 'kick' : 'hihat_closed');
+    const bus = outBus || masterGain;
     switch (type) {
-      case 'kick':         _kick(vel); break;
-      case 'snare':        _snare(vel); break;
-      case 'hihat_closed': _hihat(vel, 0.06); break;
-      case 'hihat_open':   _hihat(vel, 0.35); break;
-      case 'clap':         _clap(vel); break;
-      case 'rim':          _rim(vel); break;
-      case 'crash':        _crash(vel); break;
-      case 'ride':         _ride(vel); break;
-      case 'tom':          _tom(vel, 80 + (note - 41) * 8); break;
-      default:             _hihat(vel, 0.08); break;
+      case 'kick':         _kick(vel, bus); break;
+      case 'snare':        _snare(vel, bus); break;
+      case 'hihat_closed': _hihat(vel, 0.06, bus); break;
+      case 'hihat_open':   _hihat(vel, 0.35, bus); break;
+      case 'clap':         _clap(vel, bus); break;
+      case 'rim':          _rim(vel, bus); break;
+      case 'crash':        _crash(vel, bus); break;
+      case 'ride':         _ride(vel, bus); break;
+      case 'tom':          _tom(vel, 80 + (note - 41) * 8, bus); break;
+      default:             _hihat(vel, 0.08, bus); break;
     }
   }
 
   // ─── Kick Drum ──────────────────────────────────────────────
-  function _kick(vel) {
+  function _kick(vel, bus) {
     const now = ctx.currentTime;
     const gain = ctx.createGain();
-    gain.connect(masterGain);
+    gain.connect(bus);
 
     // Sub sine for body
     const osc = ctx.createOscillator();
@@ -213,7 +240,7 @@ const AudioEngine = (() => {
     clickGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.015);
     clickSrc.connect(clickFilter);
     clickFilter.connect(clickGain);
-    clickGain.connect(masterGain);
+    clickGain.connect(bus);
 
     gain.gain.setValueAtTime(vel * 1.1, now);
     gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
@@ -224,7 +251,7 @@ const AudioEngine = (() => {
   }
 
   // ─── Snare ──────────────────────────────────────────────────
-  function _snare(vel) {
+  function _snare(vel, bus) {
     const now = ctx.currentTime;
 
     // Noise component
@@ -240,7 +267,7 @@ const AudioEngine = (() => {
     noiseGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
     noiseSrc.connect(noiseFilter);
     noiseFilter.connect(noiseGain);
-    noiseGain.connect(masterGain);
+    noiseGain.connect(bus);
 
     // Tone component
     const osc = ctx.createOscillator();
@@ -251,7 +278,7 @@ const AudioEngine = (() => {
     toneGain.gain.setValueAtTime(vel * 0.55, now);
     toneGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
     osc.connect(toneGain);
-    toneGain.connect(masterGain);
+    toneGain.connect(bus);
 
     noiseSrc.start(now);
     osc.start(now);
@@ -259,12 +286,12 @@ const AudioEngine = (() => {
   }
 
   // ─── Hi-Hat ─────────────────────────────────────────────────
-  function _hihat(vel, duration) {
+  function _hihat(vel, duration, bus) {
     const now = ctx.currentTime;
     // Six square oscillators slightly detuned (metallic character)
     const freqs = [2060, 3128, 4256, 5768, 7840, 10400];
     const masterHHGain = ctx.createGain();
-    masterHHGain.connect(masterGain);
+    masterHHGain.connect(bus);
 
     const filter = ctx.createBiquadFilter();
     filter.type = 'highpass';
@@ -286,7 +313,7 @@ const AudioEngine = (() => {
   }
 
   // ─── Clap ───────────────────────────────────────────────────
-  function _clap(vel) {
+  function _clap(vel, bus) {
     const now = ctx.currentTime;
     const offsets = [0, 0.006, 0.012];
     offsets.forEach(offset => {
@@ -302,13 +329,13 @@ const AudioEngine = (() => {
       gainNode.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.15);
       src.connect(filter);
       filter.connect(gainNode);
-      gainNode.connect(masterGain);
+      gainNode.connect(bus);
       src.start(now + offset);
     });
   }
 
   // ─── Rim Shot ───────────────────────────────────────────────
-  function _rim(vel) {
+  function _rim(vel, bus) {
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     osc.type = 'square';
@@ -317,17 +344,17 @@ const AudioEngine = (() => {
     gain.gain.setValueAtTime(vel * 0.4, now);
     gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.05);
     osc.connect(gain);
-    gain.connect(masterGain);
+    gain.connect(bus);
     osc.start(now);
     osc.stop(now + 0.06);
   }
 
   // ─── Crash Cymbal ───────────────────────────────────────────
-  function _crash(vel) {
+  function _crash(vel, bus) {
     const now = ctx.currentTime;
     const freqs = [3150, 4523, 5860, 7420, 9800, 14000];
     const masterGainNode = ctx.createGain();
-    masterGainNode.connect(masterGain);
+    masterGainNode.connect(bus);
     masterGainNode.gain.setValueAtTime(vel * 0.3, now);
     masterGainNode.gain.exponentialRampToValueAtTime(0.0001, now + 1.2);
 
@@ -342,11 +369,11 @@ const AudioEngine = (() => {
   }
 
   // ─── Ride ───────────────────────────────────────────────────
-  function _ride(vel) {
+  function _ride(vel, bus) {
     const now = ctx.currentTime;
     const freqs = [4000, 6200, 8800];
     const gainNode = ctx.createGain();
-    gainNode.connect(masterGain);
+    gainNode.connect(bus);
     gainNode.gain.setValueAtTime(vel * 0.2, now);
     gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
 
@@ -361,7 +388,7 @@ const AudioEngine = (() => {
   }
 
   // ─── Tom ────────────────────────────────────────────────────
-  function _tom(vel, freq) {
+  function _tom(vel, freq, bus) {
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     osc.type = 'sine';
@@ -371,7 +398,7 @@ const AudioEngine = (() => {
     gain.gain.setValueAtTime(vel * 0.9, now);
     gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.35);
     osc.connect(gain);
-    gain.connect(masterGain);
+    gain.connect(bus);
     osc.start(now);
     osc.stop(now + 0.4);
   }
@@ -397,7 +424,7 @@ const AudioEngine = (() => {
   }
 
   // ─── Bass Synth ─────────────────────────────────────────────
-  function _playBass(channel, note, vel) {
+  function _playBass(channel, note, vel, bus) {
     const now = ctx.currentTime;
     const freq = _midiToFreq(note);
     const key = `${channel}-${note}`;
@@ -426,7 +453,7 @@ const AudioEngine = (() => {
     osc1.connect(filter);
     osc2.connect(filter);
     filter.connect(env);
-    env.connect(masterGain);
+    env.connect(bus || masterGain);
 
     osc1.start(now);
     osc2.start(now);
@@ -435,7 +462,7 @@ const AudioEngine = (() => {
   }
 
   // ─── Lead Synth ─────────────────────────────────────────────
-  function _playSynth(channel, note, vel) {
+  function _playSynth(channel, note, vel, bus) {
     const now = ctx.currentTime;
     const freq = _midiToFreq(note);
     const key = `${channel}-${note}`;
@@ -462,7 +489,7 @@ const AudioEngine = (() => {
     osc.connect(filter);
     osc2.connect(filter);
     filter.connect(env);
-    env.connect(masterGain);
+    env.connect(bus || masterGain);
 
     osc.start(now);
     osc2.start(now);
@@ -476,7 +503,8 @@ const AudioEngine = (() => {
   }
 
   // ─── Pad Synth ──────────────────────────────────────────────
-  function _playPad(channel, note, vel) {
+  // FIX: Store all 5 oscillators to prevent voice leak
+  function _playPad(channel, note, vel, bus) {
     const now = ctx.currentTime;
     const freq = _midiToFreq(note);
     const key = `${channel}-${note}`;
@@ -507,9 +535,14 @@ const AudioEngine = (() => {
       osc.start(now);
     });
     filter.connect(env);
-    env.connect(masterGain);
+    env.connect(bus || masterGain);
 
-    activeVoices.set(key, { osc: voices[0], osc2: voices[1], osc3: voices[2], env, release: 0.6 });
+    // Store ALL 5 voices to prevent oscillator leak
+    activeVoices.set(key, {
+      osc: voices[0], osc2: voices[1], osc3: voices[2],
+      osc4: voices[3], osc5: voices[4],
+      env, release: 0.6
+    });
   }
 
   // ─── Trigger from sequencer ─────────────────────────────────
@@ -550,23 +583,36 @@ const AudioEngine = (() => {
   function getTrackInstruments() { return trackInstruments; }
 
   function allNotesOff() {
-    activeVoices.forEach((voice, key) => {
+    activeVoices.forEach((voice) => {
       try {
         const now = ctx?.currentTime || 0;
         voice.env.gain.cancelScheduledValues(now);
         voice.env.gain.setValueAtTime(0, now);
+        // Stop all oscillators including pad voices 4 & 5
         voice.osc?.stop();
         voice.osc2?.stop();
         voice.osc3?.stop();
+        voice.osc4?.stop();
+        voice.osc5?.stop();
       } catch(e) {}
     });
     activeVoices.clear();
   }
 
+  function setTrackVolume(trackIdx, vol) {
+    // vol: 0.0–1.0
+    if (trackGainNodes[trackIdx] && ctx) {
+      trackGainNodes[trackIdx].gain.setTargetAtTime(vol, ctx.currentTime, 0.015);
+    }
+  }
+
   // ─── Spatial FX Helpers ─────────────────────────────────────
+  // FIX: Add combSum merge gain so all 4 comb outputs properly sum before allpass chain
   function _createReverb(ctx, decayTime) {
     const input = ctx.createGain();
     const output = ctx.createGain();
+    const combSum = ctx.createGain(); // summation node for parallel combs
+    combSum.gain.value = 0.25; // normalize by number of combs
 
     const combDelays = [0.029, 0.037, 0.041, 0.043];
     const combGains = [0.742, 0.733, 0.715, 0.697];
@@ -576,9 +622,12 @@ const AudioEngine = (() => {
       const feedback = ctx.createGain();
       const fbVal = Math.min(0.95, Math.pow(combGains[i], decayTime));
       feedback.gain.value = fbVal;
-      
+
+      input.connect(delay);
       delay.connect(feedback);
       feedback.connect(delay);
+      // Each comb output goes into the summation node
+      delay.connect(combSum);
       return { delay, feedback };
     });
 
@@ -592,11 +641,8 @@ const AudioEngine = (() => {
       return ap;
     });
 
-    combs.forEach(c => {
-      input.connect(c.delay);
-      c.delay.connect(allpasses[0]);
-    });
-
+    // Series: combSum → ap[0] → ap[1] → output
+    combSum.connect(allpasses[0]);
     allpasses[0].connect(allpasses[1]);
     allpasses[1].connect(output);
 
@@ -712,6 +758,19 @@ const AudioEngine = (() => {
     }
   }
 
+  function setReverbTone(freq) {
+    // freq: 500–20000 Hz high-shelf cutoff
+    if (reverbToneFilter && ctx) {
+      reverbToneFilter.frequency.setTargetAtTime(freq, ctx.currentTime, 0.05);
+    }
+  }
+
+  function setDelayTone(freq) {
+    if (delayToneFilter && ctx) {
+      delayToneFilter.frequency.setTargetAtTime(freq, ctx.currentTime, 0.05);
+    }
+  }
+
   return {
     init,
     resume,
@@ -723,12 +782,15 @@ const AudioEngine = (() => {
     isEnabled,
     setMasterVolume,
     setTrackInstrument,
+    setTrackVolume,
     getTrackInstruments,
     setReverbMix,
     setReverbDecay,
+    setReverbTone,
     setDelayMix,
     setDelayTime,
     setDelayFeedback,
+    setDelayTone,
   };
 
 })();

@@ -97,7 +97,11 @@ const SamplerEngine = (() => {
     src.start(now);
   }
 
-  return { init, getCategories, playSample };
+  function getSampleCount(category) {
+    return sampleMap[category]?.length || 0;
+  }
+
+  return { init, getCategories, playSample, getSampleCount };
 })();
 
 window.SamplerEngine = SamplerEngine;

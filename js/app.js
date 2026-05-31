@@ -26,6 +26,7 @@
   // ─── Initialize modules ───────────────────────────────────────
 
   // Sequencer: register callbacks
+  // Update transport clock on every step
   Sequencer.setStepCallback((step) => {
     UI.updatePlayhead(step);
     // Flash track activity LEDs for active steps
@@ -37,6 +38,14 @@
           if (stepData.note !== undefined) UI.flashKey(stepData.note);
         }
       });
+      // Update bar:beat:step clock
+      const bb = Sequencer.barBeat();
+      const barEl = document.getElementById('clock-bar');
+      const beatEl = document.getElementById('clock-beat');
+      const stepEl = document.getElementById('clock-step');
+      if (barEl) barEl.textContent = bb.bar;
+      if (beatEl) beatEl.textContent = bb.beat;
+      if (stepEl) stepEl.textContent = bb.step;
     }
   });
 
@@ -44,6 +53,18 @@
     UI.renderSequencer(state);
     // Sync BPM display
     document.getElementById('bpm-value').value = state.bpm;
+    // Reset clock if stopped
+    if (!state.isPlaying) {
+      const barEl = document.getElementById('clock-bar');
+      const beatEl = document.getElementById('clock-beat');
+      const stepEl = document.getElementById('clock-step');
+      if (barEl) barEl.textContent = '1';
+      if (beatEl) beatEl.textContent = '1';
+      if (stepEl) stepEl.textContent = '1';
+    }
+    // Keep undo button state in sync
+    const undoBtn = document.getElementById('btn-undo');
+    if (undoBtn) undoBtn.disabled = !Sequencer.canUndo();
   });
 
   // MIDI: register monitor element
@@ -119,6 +140,13 @@
     const val = parseInt(e.target.value) / 10;
     document.getElementById('fx-reverb-decay-val').textContent = val.toFixed(1) + 's';
     AudioEngine.setReverbDecay(val);
+  });
+
+  document.getElementById('fx-reverb-tone').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value);
+    const kHz = (val / 1000).toFixed(1);
+    document.getElementById('fx-reverb-tone-val').textContent = kHz + 'k';
+    AudioEngine.setReverbTone(val);
   });
 
   document.getElementById('fx-delay-mix').addEventListener('input', (e) => {
@@ -236,6 +264,7 @@
     UI.renderSequencer(Sequencer.getState());
     document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
     UI.showToast('Randomized all tracks!', 'info');
+    document.getElementById('btn-undo').disabled = !Sequencer.canUndo();
   });
 
   document.getElementById('btn-clear-all').addEventListener('click', () => {
@@ -243,6 +272,7 @@
     UI.renderSequencer(Sequencer.getState());
     document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
     UI.showToast('All tracks cleared', 'info');
+    document.getElementById('btn-undo').disabled = !Sequencer.canUndo();
   });
 
   // ─── Save / Load / Export ─────────────────────────────────────
@@ -286,7 +316,18 @@
   });
 
   document.getElementById('sp-confirm').addEventListener('click', () => {
-    // Apply note picker values (modal — not used directly in current flow)
+    // Commit all picker values to sequencer
+    const editing = UI.getCurrentStepEditing();
+    if (editing) {
+      const { trackIdx, stepIdx } = editing;
+      const octave = parseInt(document.getElementById('sp-octave')?.value || '4');
+      const noteInOctave = UI.getSelectedNoteInPicker();
+      const note = (octave + 1) * 12 + noteInOctave;
+      const velocity = parseInt(document.getElementById('sp-velocity').value);
+      const gate = parseFloat(document.getElementById('sp-gate').value);
+      const probability = parseInt(document.getElementById('sp-probability').value);
+      Sequencer.setStepData(trackIdx, stepIdx, { note, velocity, gate, probability });
+    }
     UI.closeNotePicker();
   });
 
@@ -313,6 +354,8 @@
         Sequencer.stop();
         document.getElementById('btn-play').classList.remove('active');
         document.getElementById('btn-play').textContent = '▶';
+        // Close any open modals
+        document.getElementById('modal-shortcuts').hidden = true;
         break;
       case 'KeyR':
         if (e.ctrlKey || e.metaKey) { e.preventDefault(); document.getElementById('btn-record').click(); }
@@ -320,8 +363,113 @@
       case 'KeyS':
         if (e.ctrlKey || e.metaKey) { e.preventDefault(); document.getElementById('btn-save').click(); }
         break;
+      case 'KeyZ':
+        if (e.ctrlKey || e.metaKey) { e.preventDefault(); document.getElementById('btn-undo').click(); }
+        break;
+      case 'Slash': // ? key (with shift)
+        if (e.shiftKey) {
+          e.preventDefault();
+          const modal = document.getElementById('modal-shortcuts');
+          modal.hidden = !modal.hidden;
+        }
+        break;
     }
   });
+
+  // ─── Undo ──────────────────────────────────────────────────────
+  document.getElementById('btn-undo').addEventListener('click', () => {
+    const ok = Sequencer.undo();
+    if (ok) {
+      UI.renderSequencer(Sequencer.getState());
+      const state = Sequencer.getState();
+      bpmInput.value = state.bpm;
+      swingSlider.value = state.swing;
+      swingVal.textContent = state.swing + '%';
+      UI.showToast('↩ Undo!', 'info');
+    }
+    document.getElementById('btn-undo').disabled = !Sequencer.canUndo();
+  });
+
+  // ─── Keyboard Shortcuts Modal ─────────────────────────────────
+  document.getElementById('btn-help').addEventListener('click', () => {
+    document.getElementById('modal-shortcuts').hidden = false;
+  });
+  document.getElementById('shortcuts-close').addEventListener('click', () => {
+    document.getElementById('modal-shortcuts').hidden = true;
+  });
+  document.getElementById('modal-shortcuts').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) e.currentTarget.hidden = true;
+  });
+
+  // ─── Save Slots ────────────────────────────────────────────────
+  let _pendingSlotId = null;
+  const slotMenu = document.getElementById('slot-menu');
+
+  function _updateSlotButtons() {
+    const meta = Storage.getSlotMeta();
+    meta.forEach(slot => {
+      const btn = document.getElementById(`slot-btn-${slot.id}`);
+      if (!btn) return;
+      btn.classList.toggle('filled', !slot.empty);
+      if (!slot.empty) {
+        const date = new Date(slot.savedAt).toLocaleTimeString();
+        btn.title = `Slot ${slot.id} — ${slot.bpm} BPM (${date})`;
+      } else {
+        btn.title = `Slot ${slot.id} — empty`;
+      }
+    });
+  }
+
+  document.querySelectorAll('.slot-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      _pendingSlotId = btn.dataset.slot;
+      // Show context menu near button
+      const rect = btn.getBoundingClientRect();
+      slotMenu.style.top = (rect.bottom + 8) + 'px';
+      slotMenu.style.left = rect.left + 'px';
+      slotMenu.hidden = false;
+    });
+  });
+
+  document.getElementById('slot-menu-save').addEventListener('click', () => {
+    if (!_pendingSlotId) return;
+    const ok = Storage.saveSlot(_pendingSlotId);
+    UI.showToast(ok ? `Saved to Slot ${_pendingSlotId}` : 'Save failed', ok ? 'success' : 'error');
+    _updateSlotButtons();
+    slotMenu.hidden = true;
+  });
+
+  document.getElementById('slot-menu-load').addEventListener('click', () => {
+    if (!_pendingSlotId) return;
+    Sequencer.saveUndo();
+    const ok = Storage.loadSlot(_pendingSlotId);
+    if (ok) {
+      UI.renderSequencer(Sequencer.getState());
+      bpmInput.value = Sequencer.getState().bpm;
+      swingSlider.value = Sequencer.getState().swing;
+      swingVal.textContent = Sequencer.getState().swing + '%';
+      UI.renderInstruments();
+      UI.showToast(`Loaded Slot ${_pendingSlotId}`, 'success');
+    } else {
+      UI.showToast(`Slot ${_pendingSlotId} is empty`, 'error');
+    }
+    document.getElementById('btn-undo').disabled = !Sequencer.canUndo();
+    slotMenu.hidden = true;
+  });
+
+  document.getElementById('slot-menu-cancel').addEventListener('click', () => {
+    slotMenu.hidden = true;
+  });
+
+  // Close slot menu on outside click
+  document.addEventListener('click', (e) => {
+    if (!slotMenu.hidden && !slotMenu.contains(e.target) && !e.target.classList.contains('slot-btn')) {
+      slotMenu.hidden = true;
+    }
+  });
+
+  // Init slot button states
+  _updateSlotButtons();
 
   // ─── Auto-save ────────────────────────────────────────────────
   Storage.startAutoSave();

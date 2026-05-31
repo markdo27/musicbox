@@ -32,6 +32,38 @@ const Sequencer = (() => {
   // Note-off tracking
   const pendingNoteOffs = []; // [{time, channel, note, outputId}]
 
+  // Undo history (max 20 snapshots)
+  const undoStack = [];
+  const UNDO_MAX = 20;
+
+  function _deepCloneState() {
+    return {
+      bpm: state.bpm,
+      swing: state.swing,
+      stepCount: state.stepCount,
+      tracks: state.tracks.map(t => ({
+        ...t,
+        steps: t.steps.map(s => ({ ...s }))
+      }))
+    };
+  }
+
+  function saveUndo() {
+    undoStack.push(_deepCloneState());
+    if (undoStack.length > UNDO_MAX) undoStack.shift();
+  }
+
+  function undo() {
+    if (undoStack.length === 0) return false;
+    const snapshot = undoStack.pop();
+    state.bpm = snapshot.bpm;
+    state.swing = snapshot.swing;
+    state.stepCount = snapshot.stepCount;
+    state.tracks = snapshot.tracks;
+    if (onStateChange) onStateChange({ ...state });
+    return true;
+  }
+
   // ─── Init AudioContext ───────────────────────────────────────
   function _ensureAudioCtx() {
     if (!audioCtx) {
@@ -241,6 +273,7 @@ const Sequencer = (() => {
   }
 
   function toggleStep(trackIdx, stepIdx) {
+    saveUndo();
     const step = state.tracks[trackIdx]?.steps[stepIdx];
     if (!step) return;
     step.active = !step.active;
@@ -264,6 +297,7 @@ const Sequencer = (() => {
   }
 
   function clearAllTracks() {
+    saveUndo();
     state.tracks.forEach((_, i) => clearTrack(i));
     if (onStateChange) onStateChange({ ...state });
   }
@@ -384,6 +418,7 @@ const Sequencer = (() => {
   }
 
   function randomizeAll() {
+    saveUndo();
     const root = ROOT_NOTES[Math.floor(Math.random() * ROOT_NOTES.length)];
     const scaleKeys = Object.keys(SCALES);
     const scaleKey = scaleKeys[Math.floor(Math.random() * scaleKeys.length)];
@@ -709,6 +744,7 @@ const Sequencer = (() => {
     const preset = PRESETS[presetId];
     if (!preset) return;
 
+    saveUndo();
     const wasPlaying = state.isPlaying;
     stop();
 
@@ -750,12 +786,15 @@ const Sequencer = (() => {
     if (wasPlaying) play();
   }
 
-  // ─── Mute / Solo Logic ───────────────────────────────────────
+  // ─── Mute / Solo Logic ──────────────────────────────────────
   function toggleMute(trackIdx) {
     const t = state.tracks[trackIdx];
     if (!t) return;
     t.muted = !t.muted;
-    if (t.muted) MidiManager.allNotesOff();
+    if (t.muted) {
+      MidiManager.allNotesOff();
+      if (window.AudioEngine) AudioEngine.allNotesOff();
+    }
   }
 
   function toggleSolo(trackIdx) {
@@ -768,13 +807,25 @@ const Sequencer = (() => {
       t.soloed = true;
       state.tracks.forEach((tr, i) => { if (i !== trackIdx) tr.muted = true; });
     }
+    // Stop all currently playing notes so no soloed track keeps ringing
+    MidiManager.allNotesOff();
+    if (window.AudioEngine) AudioEngine.allNotesOff();
   }
 
-  // ─── Getters ────────────────────────────────────────────────
+  // ─── Getters ──────────────────────────────────────────
   function getState() { return state; }
   function getTracks() { return state.tracks; }
   function isPlaying() { return state.isPlaying; }
   function getCurrentStep() { return state.currentStep; }
+  function canUndo() { return undoStack.length > 0; }
+
+  function barBeat() {
+    const s = Math.max(0, state.currentStep);
+    const bar  = Math.floor(s / 16) + 1;
+    const beat = Math.floor((s % 16) / 4) + 1;
+    const step = (s % 4) + 1;
+    return { bar, beat, step };
+  }
 
   // ─── Callbacks ──────────────────────────────────────────────
   function setStepCallback(fn) { onStepChange = fn; }
@@ -789,8 +840,9 @@ const Sequencer = (() => {
     randomizeTrack, randomizeAll,
     applyPreset,
     toggleMute, toggleSolo,
-    getState, getTracks, isPlaying, getCurrentStep,
+    getState, getTracks, isPlaying, getCurrentStep, barBeat,
     setStepCallback, setStateCallback,
+    saveUndo, undo, canUndo,
   };
 
 })();

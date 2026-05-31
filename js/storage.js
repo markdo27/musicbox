@@ -8,12 +8,13 @@ const Storage = (() => {
 
   const LS_KEY = 'musicbox_project';
   const LS_SLOTS_KEY = 'musicbox_slots';
+  const SLOT_IDS = ['A', 'B', 'C', 'D'];
 
-  // ─── Save project to localStorage ───────────────────────────
-  function save() {
+  function _buildProjectSnapshot(name = 'MusicBox Project') {
     const state = Sequencer.getState();
-    const project = {
+    return {
       version: 1,
+      name,
       savedAt: new Date().toISOString(),
       bpm: state.bpm,
       swing: state.swing,
@@ -27,6 +28,11 @@ const Storage = (() => {
       })),
       instruments: window.AudioEngine ? AudioEngine.getTrackInstruments().map(i => i.type) : [],
     };
+  }
+
+  // ─── Save project to localStorage ────────────────────────────
+  function save() {
+    const project = _buildProjectSnapshot();
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(project));
       return true;
@@ -69,26 +75,46 @@ const Storage = (() => {
 
   // ─── Export project as JSON file ─────────────────────────────
   function exportJson() {
-    const state = Sequencer.getState();
-    const project = {
-      version: 1,
-      name: 'MusicBox Project',
-      savedAt: new Date().toISOString(),
-      bpm: state.bpm,
-      swing: state.swing,
-      stepCount: state.stepCount,
-      tracks: state.tracks.map(t => ({
-        name: t.name,
-        midiChannel: t.midiChannel,
-        muted: t.muted,
-        volume: t.volume,
-        steps: t.steps.map(s => ({ ...s })),
-      })),
-      instruments: window.AudioEngine ? AudioEngine.getTrackInstruments().map(i => i.type) : [],
-    };
-
+    const project = _buildProjectSnapshot();
     const blob = new Blob([JSON.stringify(project, null, 2)], { type: 'application/json' });
     _download(blob, `musicbox_${Date.now()}.json`);
+  }
+
+  // ─── 4 Named Save Slots (A/B/C/D) ────────────────────────────
+  function saveSlot(slotId) {
+    if (!SLOT_IDS.includes(slotId)) return false;
+    const project = _buildProjectSnapshot(`Slot ${slotId}`);
+    try {
+      localStorage.setItem(`musicbox_slot_${slotId}`, JSON.stringify(project));
+      return true;
+    } catch (e) {
+      console.error(`[Storage] Slot ${slotId} save failed:`, e);
+      return false;
+    }
+  }
+
+  function loadSlot(slotId) {
+    if (!SLOT_IDS.includes(slotId)) return false;
+    try {
+      const raw = localStorage.getItem(`musicbox_slot_${slotId}`);
+      if (!raw) return false;
+      const project = JSON.parse(raw);
+      return applyProject(project);
+    } catch (e) {
+      console.error(`[Storage] Slot ${slotId} load failed:`, e);
+      return false;
+    }
+  }
+
+  function getSlotMeta() {
+    return SLOT_IDS.map(id => {
+      try {
+        const raw = localStorage.getItem(`musicbox_slot_${id}`);
+        if (!raw) return { id, empty: true };
+        const p = JSON.parse(raw);
+        return { id, empty: false, savedAt: p.savedAt, bpm: p.bpm };
+      } catch { return { id, empty: true }; }
+    });
   }
 
   // ─── Import JSON file ────────────────────────────────────────
@@ -246,6 +272,7 @@ const Storage = (() => {
     exportJson, importJson,
     exportMidi,
     startAutoSave,
+    saveSlot, loadSlot, getSlotMeta,
   };
 
 })();

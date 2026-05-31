@@ -1530,3 +1530,250 @@ body {
 .fx-select:hover {
   border-color: var(--border-active);
 }
+
+/* ─── Transport Clock ────────────────────────────────────────── */
+.transport-clock {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: var(--accent-cyan);
+  text-shadow: 0 0 12px rgba(0,212,255,0.7);
+  background: rgba(0,212,255,0.06);
+  border: 1px solid rgba(0,212,255,0.2);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  min-width: 80px;
+  text-align: center;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.clock-sep {
+  color: rgba(0,212,255,0.4);
+  margin: 0 1px;
+}
+
+/* ─── Save Slots ─────────────────────────────────────────────── */
+.save-slots {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.slots-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: 1px;
+  margin-right: 2px;
+}
+
+.slot-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-muted);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.slot-btn:hover {
+  border-color: var(--accent-amber);
+  color: var(--accent-amber);
+  box-shadow: 0 0 8px rgba(255,170,0,0.4);
+}
+
+.slot-btn.filled {
+  border-color: var(--accent-amber);
+  background: rgba(255,170,0,0.12);
+  color: var(--accent-amber);
+  box-shadow: 0 0 6px rgba(255,170,0,0.3);
+}
+
+/* Slot context menu */
+.slot-menu {
+  position: fixed;
+  z-index: 500;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-md);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  backdrop-filter: blur(10px);
+  min-width: 160px;
+}
+
+.slot-menu[hidden] { display: none; }
+
+.slot-menu-btn {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.1s;
+}
+
+.slot-menu-btn:hover {
+  background: var(--bg-glass);
+}
+
+.slot-menu-cancel {
+  color: var(--text-muted);
+  border-top: 1px solid var(--border-subtle);
+  margin-top: 2px;
+  padding-top: 10px;
+}
+
+/* ─── Undo Button ────────────────────────────────────────────── */
+.undo-btn {
+  font-size: 16px;
+  transition: all 0.15s;
+}
+
+.undo-btn:not(:disabled):hover {
+  color: var(--accent-cyan);
+  text-shadow: 0 0 8px var(--accent-cyan);
+}
+
+.undo-btn:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
+}
+
+/* ─── Help Button ────────────────────────────────────────────── */
+.help-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.help-btn:hover {
+  border-color: var(--accent-purple);
+  color: var(--accent-purple);
+  box-shadow: 0 0 8px rgba(192,132,252,0.4);
+}
+
+/* ─── Keyboard Shortcuts Modal ───────────────────────────────── */
+.shortcuts-box {
+  max-width: 420px;
+}
+
+.shortcuts-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 16px;
+  margin: 16px 0;
+  align-items: center;
+}
+
+kbd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-muted);
+  border-bottom: 2px solid var(--border-active);
+  border-radius: 4px;
+  padding: 3px 7px;
+  color: var(--accent-cyan);
+  white-space: nowrap;
+}
+
+/* ─── VU Meters ──────────────────────────────────────────────── */
+.mixer-fader-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mixer-vu {
+  height: 3px;
+  border-radius: 99px;
+  background: var(--bg-surface);
+  overflow: hidden;
+  position: relative;
+}
+
+.mixer-vu::after {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: 0%;
+  background: linear-gradient(to right, var(--accent-green), var(--accent-amber), var(--accent-red));
+  border-radius: 99px;
+  transition: width 0.15s ease-out;
+}
+
+.mixer-vu.vu-active::after {
+  width: 100%;
+}
+
+.mixer-vu.vu-active {
+  transition: none;
+}
+
+/* ─── Playable Piano Keys ────────────────────────────────────── */
+.key {
+  cursor: pointer;
+  user-select: none;
+  transition: filter 0.05s, transform 0.05s;
+}
+
+.white-key {
+  border: 1px solid var(--border-subtle);
+  border-top: none;
+}
+
+.white-key:hover {
+  background: rgba(255,255,255,0.08) !important;
+  filter: brightness(1.2);
+}
+
+.white-key:active,
+.white-key.playing-key {
+  background: rgba(0,212,255,0.15) !important;
+  transform: scaleY(0.97);
+  transform-origin: top center;
+}
+
+.black-key:hover {
+  filter: brightness(1.5);
+}
+
+.black-key:active,
+.black-key.playing-key {
+  filter: brightness(2);
+  transform: translateX(-50%) scaleY(0.95);
+  transform-origin: top center;
+}
+
+/* ─── Step Editor Hint ───────────────────────────────────────── */
+.hint-text {
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+  padding: 16px;
+}
+

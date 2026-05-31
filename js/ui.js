@@ -22,6 +22,8 @@ const UI = (() => {
   const SHARP_NOTES = new Set([1,3,6,8,10]); // C#, D#, F#, G#, A#
 
   let currentStepBeingEdited = null; // { trackIdx, stepIdx }
+  let _selectedNoteInPicker = 0;
+  let _pickerOctave = 4;
 
   // ─── Render genre preset buttons ────────────────────────────
   function renderPresets() {
@@ -61,11 +63,17 @@ const UI = (() => {
     showToast(`Loaded: ${preset.name}`, 'info');
   }
 
-  // ─── Render full sequencer (called on state change) ──────────
+  // ─── Render full sequencer (called on state change) ────────────
   function renderSequencer(state) {
     renderStepIndicators(state.stepCount);
     renderTracks(state);
     renderMixer(state.tracks);
+    // Clear step editor panel so stale data doesn't show after preset/randomize
+    if (currentStepBeingEdited) {
+      const content = document.getElementById('step-editor-content');
+      if (content) content.innerHTML = '<p class="hint-text">Click a step to edit</p>';
+      currentStepBeingEdited = null;
+    }
   }
 
   // ─── Step indicator row ───────────────────────────────────────
@@ -345,12 +353,11 @@ const UI = (() => {
   function _refreshStepBtn(trackIdx, stepIdx) {
     const btn = document.getElementById(`step-${trackIdx}-${stepIdx}`);
     if (!btn) return;
-    const step = Sequencer.getStep(trackIdx, stepIdx);
     const color = TRACK_COLORS[trackIdx % TRACK_COLORS.length];
-    _updateStepBtn(btn, step, color);
+    _updateStepBtn(btn, Sequencer.getStep(trackIdx, stepIdx), color);
   }
 
-  // ─── Mixer ────────────────────────────────────────────────────
+  // ─── Mixer ─────────────────────────────────────────────────────
   function renderMixer(tracks) {
     const container = document.getElementById('mixer-tracks');
     container.innerHTML = '';
@@ -361,14 +368,19 @@ const UI = (() => {
       div.innerHTML = `
         <div class="mixer-color-dot" style="background:${color.css}; box-shadow: 0 0 6px ${color.css}66;"></div>
         <span class="mixer-track-name" id="mixer-name-${i}">${escHtml(track.name)}</span>
-        <input type="range" class="mixer-fader" id="mixer-vol-${i}" min="0" max="100" value="${track.volume}"
-          title="Volume: ${track.volume}%" />
+        <div class="mixer-fader-wrap">
+          <input type="range" class="mixer-fader" id="mixer-vol-${i}" min="0" max="100" value="${track.volume}"
+            title="Volume: ${track.volume}%" />
+          <div class="mixer-vu" id="mixer-vu-${i}"></div>
+        </div>
         <span class="mixer-vol-val" id="mixer-vol-val-${i}">${track.volume}</span>
       `;
       div.querySelector(`#mixer-vol-${i}`).addEventListener('input', e => {
         const val = parseInt(e.target.value);
         Sequencer.setTrackProperty(i, 'volume', val);
         document.getElementById(`mixer-vol-val-${i}`).textContent = val;
+        // Real-time Web Audio volume control
+        if (window.AudioEngine) AudioEngine.setTrackVolume(i, val / 100);
       });
       container.appendChild(div);
     });
@@ -440,6 +452,13 @@ const UI = (() => {
     const totalWhites = whites.length;
     const keyWidthPct = 100 / totalWhites;
 
+    function _playKey(midi) {
+      if (window.AudioEngine) {
+        AudioEngine.init();
+        AudioEngine.triggerNote(-1, 1, midi, 90, 0.4);
+      }
+    }
+
     // White keys
     whites.forEach(k => {
       const el = document.createElement('div');
@@ -447,6 +466,9 @@ const UI = (() => {
       el.id = `key-${k.midi}`;
       el.style.width = keyWidthPct + '%';
       el.title = k.name;
+      // Playable
+      el.addEventListener('mousedown', () => _playKey(k.midi));
+      el.addEventListener('touchstart', (e) => { e.preventDefault(); _playKey(k.midi); }, { passive: false });
       wrap.appendChild(el);
     });
 
@@ -457,6 +479,9 @@ const UI = (() => {
       el.id = `key-${k.midi}`;
       el.style.left = (k.whiteIdx * keyWidthPct + keyWidthPct * 0.6) + '%';
       el.title = k.name;
+      // Playable
+      el.addEventListener('mousedown', (e) => { e.stopPropagation(); _playKey(k.midi); });
+      el.addEventListener('touchstart', (e) => { e.preventDefault(); e.stopPropagation(); _playKey(k.midi); }, { passive: false });
       wrap.appendChild(el);
     });
   }
@@ -471,9 +496,16 @@ const UI = (() => {
   // ─── Track activity flash ─────────────────────────────────────
   function flashTrackActivity(trackIdx) {
     const el = document.getElementById(`track-activity-${trackIdx}`);
-    if (!el) return;
-    el.classList.add('active');
-    setTimeout(() => el.classList.remove('active'), 120);
+    if (el) {
+      el.classList.add('active');
+      setTimeout(() => el.classList.remove('active'), 120);
+    }
+    // Also flash the VU meter in the mixer
+    const vu = document.getElementById(`mixer-vu-${trackIdx}`);
+    if (vu) {
+      vu.classList.add('vu-active');
+      setTimeout(() => vu.classList.remove('vu-active'), 150);
+    }
   }
 
   // ─── Toast notification ───────────────────────────────────────
@@ -509,12 +541,16 @@ const UI = (() => {
       grid.appendChild(btn);
     });
 
-    // Octave selector
-    let pickerOctave = Math.floor((step.note || 60) / 12) - 1;
+    // Set initial note state
+    _pickerOctave = Math.floor((step.note || 60) / 12) - 1;
     _selectedNoteInPicker = (step.note || 60) % 12;
 
     // Highlight current note
     grid.children[_selectedNoteInPicker]?.classList.add('selected');
+
+    // Sync octave selector
+    const octSel = document.getElementById('sp-octave');
+    if (octSel) octSel.value = String(_pickerOctave);
 
     // Set initial values
     document.getElementById('sp-velocity').value = step.velocity || 100;
@@ -525,8 +561,6 @@ const UI = (() => {
 
     modal.hidden = false;
   }
-
-  let _selectedNoteInPicker = 0;
 
   function closeNotePicker() {
     document.getElementById('modal-note-picker').hidden = true;
@@ -563,9 +597,11 @@ const UI = (() => {
         const cats = SamplerEngine.getCategories();
         if (cats.length > 0) {
           options += `<optgroup label="Strudel Samples">`;
-          options += cats.map(c => 
-            `<option value="${c}" ${instr.type === c ? 'selected' : ''}>📁 ${c}</option>`
-          ).join('');
+          options += cats.map(c => {
+            const count = SamplerEngine.getSampleCount ? SamplerEngine.getSampleCount(c) : '';
+            const badge = count ? ` (${count})` : '';
+            return `<option value="${c}" ${instr.type === c ? 'selected' : ''}>\uD83D\uDCC1 ${c}${badge}</option>`;
+          }).join('');
           options += `</optgroup>`;
         }
       }
@@ -629,6 +665,8 @@ const UI = (() => {
     closeNotePicker,
     TRACK_COLORS,
     syncSpatialSliders,
+    getCurrentStepEditing: () => currentStepBeingEdited,
+    getSelectedNoteInPicker: () => _selectedNoteInPicker,
   };
 
 })();
