@@ -16,13 +16,16 @@ const MidiManager = (() => {
   let onDeviceChange = null; // callback → UI refresh
   let onMessage = null;      // callback → monitor
 
-  // Behringer device CC profiles
+  // Behringer / Roland device CC profiles
+  // clock:true = device accepts MIDI clock sync
   const DEVICE_PROFILES = {
-    'TD-3':    { cutoff: 74, resonance: 71, envMod: 79, accent: 65, decay: 80 },
-    'Model D': { cutoff: 74, resonance: 71, glide: 5, volume: 7 },
-    'Neutron':  { cutoff: 74, resonance: 71, drive: 30, osc_mix: 31 },
-    'Crave':   { cutoff: 74, resonance: 71, glide: 5 },
-    'RD-8':    { tempo: 0 },
+    'RD-6':    { clock: true,  tempo: 0 },                                          // ← NEW
+    'RD-8':    { clock: true,  tempo: 0 },
+    'TD-3':    { clock: false, cutoff: 74, resonance: 71, envMod: 79, accent: 65, decay: 80 },
+    'Crave':   { clock: false, cutoff: 74, resonance: 71, glide: 5 },
+    'Edge':    { clock: false, cutoff: 74 },                                         // ← NEW
+    'Model D': { clock: false, cutoff: 74, resonance: 71, glide: 5, volume: 7 },
+    'Neutron': { clock: false, cutoff: 74, resonance: 71, drive: 30, osc_mix: 31 },
   };
 
   // ─── Request MIDI Access ────────────────────────────────────
@@ -65,12 +68,12 @@ const MidiManager = (() => {
   function getDeviceList() {
     const list = [];
     outputs.forEach((out) => {
-      list.push({ id: out.id, name: out.name, type: 'output', profile: _matchProfile(out.name) });
+      list.push({ id: out.id, name: out.name, type: 'output', profile: _matchProfile(out.name), connected: true });
     });
     inputs.forEach((inp) => {
       // Avoid duplicates when device has same name for in+out
       if (!list.find(d => d.name === inp.name)) {
-        list.push({ id: inp.id, name: inp.name, type: 'input', profile: _matchProfile(inp.name) });
+        list.push({ id: inp.id, name: inp.name, type: 'input', profile: _matchProfile(inp.name), connected: true });
       }
     });
     return list;
@@ -137,19 +140,36 @@ const MidiManager = (() => {
 
   // ─── MIDI Clock ─────────────────────────────────────────────
   // 24 pulses per quarter note
+  // Broadcasts to ALL outputs with clock:true profile, or ALL if none have a profile
   function startClock(bpm) {
     stopClock();
-    if (!getSelectedOutput()) return;
-    // Send Start message
-    getSelectedOutput().send([0xFA]);
+    if (outputs.size === 0) return;
+
+    // Determine which outputs receive clock
+    const clockOutputs = [];
+    outputs.forEach(out => {
+      const profileKey = _matchProfile(out.name);
+      const profile = profileKey ? DEVICE_PROFILES[profileKey] : null;
+      // Send to: devices with clock:true, or all devices if no profiles matched
+      if (!profile || profile.clock) clockOutputs.push(out);
+    });
+    // Fallback: if no clock-capable device found, send to selected output
+    if (clockOutputs.length === 0) {
+      const sel = getSelectedOutput();
+      if (sel) clockOutputs.push(sel);
+    }
+
+    // Send Start message to all clock outputs
+    clockOutputs.forEach(out => out.send([0xFA]));
+
     const intervalMs = (60000 / bpm) / 24;
     clockRunning = true;
-    let lastTime = performance.now();
 
     function tick() {
       if (!clockRunning) return;
-      const out = getSelectedOutput();
-      if (out) out.send([0xF8]); // Clock pulse
+      clockOutputs.forEach(out => {
+        try { out.send([0xF8]); } catch(e) {} // Clock pulse
+      });
     }
 
     clockInterval = setInterval(tick, intervalMs);
@@ -160,9 +180,11 @@ const MidiManager = (() => {
       clearInterval(clockInterval);
       clockInterval = null;
     }
-    const out = getSelectedOutput();
-    if (out && clockRunning) {
-      out.send([0xFC]); // Stop
+    if (clockRunning) {
+      // Broadcast Stop to all outputs
+      outputs.forEach(out => {
+        try { out.send([0xFC]); } catch(e) {}; // Stop
+      });
     }
     clockRunning = false;
   }

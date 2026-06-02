@@ -250,8 +250,10 @@ const UI = (() => {
 
   function _updateStepBtn(btn, step, color) {
     if (!step) return;
-    btn.classList.toggle('active', step.active);
-    btn.classList.toggle('has-prob', step.active && step.probability < 100);
+    btn.classList.toggle('active',      step.active);
+    btn.classList.toggle('has-prob',    step.active && step.probability < 100);
+    btn.classList.toggle('step-accent', step.active && (step.accent || false));
+    btn.classList.toggle('step-slide',  step.active && (step.slide || false));
 
     const velPct = step.active ? Math.round((step.velocity / 127) * 100) : 0;
     btn.style.setProperty('--vel-bar', velPct + '%');
@@ -261,6 +263,7 @@ const UI = (() => {
       noteLabel.textContent = step.active ? midiToName(step.note) : '';
     }
   }
+
 
   // ─── Step Editor sidebar panel ────────────────────────────────
   function _openStepEditor(trackIdx, stepIdx) {
@@ -301,9 +304,19 @@ const UI = (() => {
         <input type="range" class="se-slider" id="se-prob" min="0" max="100" value="${step.probability}" />
         <span class="se-value" id="se-prob-val">${step.probability}%</span>
       </div>
+      <div class="se-row se-flags">
+        <label class="se-flag-label ${step.accent ? 'flag-on' : ''}" id="se-accent-label">
+          <input type="checkbox" id="se-accent" ${step.accent ? 'checked' : ''}>
+          <span>&#9889; Accent</span>
+        </label>
+        <label class="se-flag-label ${step.slide ? 'flag-on' : ''}" id="se-slide-label">
+          <input type="checkbox" id="se-slide" ${step.slide ? 'checked' : ''}>
+          <span>&#8594; Slide</span>
+        </label>
+      </div>
       <div class="se-row">
         <button class="btn-secondary" id="se-toggle-active" style="flex:1">
-          ${step.active ? '🔴 Deactivate' : '🟢 Activate'}
+          ${step.active ? '&#128308; Deactivate' : '&#128994; Activate'}
         </button>
       </div>
     `;
@@ -323,12 +336,23 @@ const UI = (() => {
     document.getElementById('se-gate').addEventListener('change', e => {
       _applyStepEdit({ gate: parseFloat(e.target.value) });
     });
+    document.getElementById('se-accent').addEventListener('change', e => {
+      _applyStepEdit({ accent: e.target.checked });
+      document.getElementById('se-accent-label').classList.toggle('flag-on', e.target.checked);
+      _refreshStepBtn(trackIdx, stepIdx);
+    });
+    document.getElementById('se-slide').addEventListener('change', e => {
+      _applyStepEdit({ slide: e.target.checked });
+      document.getElementById('se-slide-label').classList.toggle('flag-on', e.target.checked);
+      _refreshStepBtn(trackIdx, stepIdx);
+    });
     document.getElementById('se-toggle-active').addEventListener('click', () => {
       Sequencer.toggleStep(trackIdx, stepIdx);
       _openStepEditor(trackIdx, stepIdx); // re-render
       _refreshStepBtn(trackIdx, stepIdx);
     });
   }
+
 
   function _buildNoteOptions(selectedNote) {
     const options = [];
@@ -387,43 +411,65 @@ const UI = (() => {
   }
 
   // ─── MIDI Device Panel ────────────────────────────────────────
+  // Named hardware cards: always shown (connected or offline)
+  const KNOWN_HARDWARE = [
+    { name: 'RD-6',  desc: 'Drum Machine',      color: '#00d4ff' },
+    { name: 'TD-3',  desc: 'Acid 303 Bass',      color: '#00ff88' },
+    { name: 'Crave', desc: 'Analogue Monosynth', color: '#ffaa00' },
+    { name: 'Edge',  desc: 'Effects Synth',      color: '#c084fc' },
+  ];
+
   function renderDevices(deviceList) {
-    const list = document.getElementById('device-list');
-    const noMsg = document.getElementById('no-devices-msg');
-    const dot = document.getElementById('midi-dot');
+    const list     = document.getElementById('device-list');
+    const noMsg    = document.getElementById('no-devices-msg');
+    const dot      = document.getElementById('midi-dot');
     const statusText = document.getElementById('midi-status-text');
 
-    if (deviceList.length === 0) {
-      list.innerHTML = '';
-      list.appendChild(noMsg);
-      noMsg.style.display = '';
-      dot.classList.remove('connected');
-      statusText.textContent = 'No MIDI';
-      return;
-    }
-
+    const anyConnected = deviceList.length > 0;
     noMsg.style.display = 'none';
     list.innerHTML = '';
-    dot.classList.add('connected');
-    statusText.textContent = `${deviceList.length} device${deviceList.length !== 1 ? 's' : ''}`;
+    dot.classList.toggle('connected', anyConnected);
+    statusText.textContent = anyConnected
+      ? `${deviceList.length} device${deviceList.length !== 1 ? 's' : ''}`
+      : 'No MIDI';
 
-    deviceList.forEach(device => {
-      const item = document.createElement('div');
-      item.className = 'device-item';
-      const profile = device.profile ? `(${device.profile})` : '';
-      item.innerHTML = `
-        <span class="device-icon">${device.type === 'output' ? '📤' : '📥'}</span>
-        <div class="device-info">
-          <div class="device-name" title="${escHtml(device.name)}">${escHtml(device.name)} ${profile}</div>
-          <div class="device-type">${device.type}</div>
+    // Known hardware — always rendered
+    KNOWN_HARDWARE.forEach(hw => {
+      const connected = deviceList.find(d => d.name.toLowerCase().includes(hw.name.toLowerCase()));
+      const card = document.createElement('div');
+      card.className = 'device-card' + (connected ? ' device-connected' : ' device-offline');
+      card.innerHTML = `
+        <div class="device-card-name" style="color:${hw.color}">${hw.name}</div>
+        <div class="device-card-desc">${hw.desc}</div>
+        <div class="device-card-status">
+          <span class="device-status-dot ${connected ? 'online' : 'offline'}"></span>
+          <span class="device-status-text">${connected ? 'Connected' : 'Offline'}</span>
         </div>
-        ${device.type === 'output' ? `<select class="device-ch-select" title="MIDI Ch">
-          ${Array.from({length:16},(_,i)=>`<option value="${i+1}">Ch${i+1}</option>`).join('')}
-        </select>` : ''}
       `;
-      list.appendChild(item);
+      list.appendChild(card);
+    });
+
+    // Additional connected devices not in known list
+    deviceList.forEach(device => {
+      const isKnown = KNOWN_HARDWARE.some(hw => device.name.toLowerCase().includes(hw.name.toLowerCase()));
+      if (!isKnown) {
+        const item = document.createElement('div');
+        item.className = 'device-card device-connected';
+        const typeIcon = device.type === 'output' ? '>' : '<';
+        item.innerHTML = `
+          <div class="device-card-name">[${typeIcon}] ${escHtml(device.name)}</div>
+          <div class="device-card-desc">${device.type}${device.profile ? ' - ' + device.profile : ''}</div>
+          <div class="device-card-status">
+            <span class="device-status-dot online"></span>
+            <span class="device-status-text">Connected</span>
+          </div>
+        `;
+        list.appendChild(item);
+      }
     });
   }
+
+
 
   // ─── Piano keyboard visualizer ────────────────────────────────
   function renderKeyboard() {
@@ -569,11 +615,13 @@ const UI = (() => {
 
   // ─── Instrument Panel ─────────────────────────────────────────
   const INSTRUMENT_TYPES = [
-    { id: 'drum',  label: 'Drum',  icon: '🥁', desc: 'Kick/Snare/HH synthesis' },
-    { id: 'bass',  label: 'Bass',  icon: '🎸', desc: 'Saw+Sub synth, fat filter' },
-    { id: 'lead',  label: 'Lead',  icon: '🎹', desc: 'Square/Saw, bright filter' },
-    { id: 'pad',   label: 'Pad',   icon: '🌊', desc: '5-voice detuned pad, slow attack' },
+    { id: 'drum',  label: 'Drum',     icon: '&#x1F941;', desc: 'TR-606 kick/snare/hihat synthesis' },
+    { id: 'acid',  label: 'Acid 303', icon: '&#x1F9EA;', desc: 'TB-303 sawtooth + filter sweep + slide' },
+    { id: 'bass',  label: 'Bass',     icon: '&#x1F3B8;', desc: 'Saw+Sub synth, fat filter' },
+    { id: 'lead',  label: 'Lead',     icon: '&#x1F3B9;', desc: 'Dual saw monosynth, ladder filter' },
+    { id: 'pad',   label: 'Pad',      icon: '&#x1F30A;', desc: '5-voice detuned pad, slow attack' },
   ];
+
 
   function renderInstruments() {
     const container = document.getElementById('instrument-list');

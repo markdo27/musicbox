@@ -7,21 +7,24 @@
 (async function init() {
 
   // ─── Default tracks (8 empty tracks) ─────────────────────────
+  // audioMode: 'both' | 'internal' | 'midi'
   const DEFAULT_TRACKS = [
-    { name: 'Kick',    midiChannel: 10, muted: false, volume: 100 },
-    { name: 'Snare',   midiChannel: 10, muted: false, volume: 100 },
-    { name: 'HH',      midiChannel: 10, muted: false, volume: 100 },
-    { name: 'Perc',    midiChannel: 10, muted: false, volume: 100 },
-    { name: 'Bass',    midiChannel: 1,  muted: false, volume: 100 },
-    { name: 'Lead',    midiChannel: 2,  muted: false, volume: 100 },
-    { name: 'Chord',   midiChannel: 3,  muted: false, volume: 100 },
-    { name: 'FX',      midiChannel: 4,  muted: false, volume: 100 },
+    { name: 'Kick',    midiChannel: 10, muted: false, volume: 100, audioMode: 'both' },
+    { name: 'Snare',   midiChannel: 10, muted: false, volume: 100, audioMode: 'both' },
+    { name: 'HH',      midiChannel: 10, muted: false, volume: 100, audioMode: 'both' },
+    { name: 'Perc',    midiChannel: 10, muted: false, volume: 100, audioMode: 'both' },
+    { name: 'Bass',    midiChannel: 1,  muted: false, volume: 100, audioMode: 'both' },
+    { name: 'Lead',    midiChannel: 2,  muted: false, volume: 100, audioMode: 'both' },
+    { name: 'Chord',   midiChannel: 3,  muted: false, volume: 100, audioMode: 'both' },
+    { name: 'FX',      midiChannel: 4,  muted: false, volume: 100, audioMode: 'both' },
   ].map(t => ({
     ...t,
     steps: Array.from({ length: 16 }, () => ({
       active: false, note: 60, velocity: 100, gate: 0.5, probability: 100,
+      accent: false, slide: false,
     })),
   }));
+
 
   // ─── Initialize modules ───────────────────────────────────────
 

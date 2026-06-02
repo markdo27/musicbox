@@ -905,6 +905,119 @@ body {
   background: var(--border-muted);
 }
 
+/* ── Accent: amber top border + glow ─────────────────────────── */
+.step-btn.step-accent {
+  border-top: 2px solid var(--accent-amber) !important;
+  box-shadow: 0 0 8px rgba(255,170,0,0.35);
+}
+.step-btn.step-accent .step-note-label {
+  color: var(--accent-amber);
+}
+
+/* ── Slide: right-arrow pip in top-right corner ─────────────── */
+.step-btn.step-slide::after {
+  content: '→';
+  position: absolute;
+  top: 1px; right: 2px;
+  font-size: 7px;
+  line-height: 1;
+  color: var(--accent-green);
+  opacity: 0.9;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* ── Device cards (MIDI panel) ──────────────────────────────── */
+.device-card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  font-size: 11px;
+  transition: border-color 0.2s, background 0.2s;
+}
+.device-card-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.device-card-desc {
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+.device-card-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.device-status-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.device-status-dot.online {
+  background: var(--accent-green);
+  box-shadow: 0 0 6px rgba(0,255,136,0.7);
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+.device-status-dot.offline {
+  background: var(--text-muted);
+}
+.device-status-text {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+.device-card.device-connected {
+  border-color: rgba(0,255,136,0.2);
+}
+.device-card.device-offline {
+  opacity: 0.55;
+}
+
+/* ── Step editor accent/slide flag row ──────────────────────── */
+.se-flags {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.se-flag-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-muted);
+  transition: all 0.15s;
+  user-select: none;
+}
+.se-flag-label input[type="checkbox"] {
+  width: 12px; height: 12px;
+  accent-color: var(--accent-amber);
+  cursor: pointer;
+}
+.se-flag-label:hover {
+  border-color: var(--border-muted);
+  color: var(--text-primary);
+}
+.se-flag-label.flag-on {
+  border-color: var(--accent-amber);
+  background: rgba(255,170,0,0.1);
+  color: var(--accent-amber);
+}
+
+
 /* ─── MIXER ─────────────────────────────────────────────────── */
 .mixer-tracks {
   display: flex;
