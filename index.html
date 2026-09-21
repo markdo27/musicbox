@@ -87,6 +87,7 @@
       <button class="icon-btn" id="btn-load" title="Load Project">📂</button>
       <button class="icon-btn" id="btn-export-midi" title="Export MIDI">⬇ .mid</button>
       <button class="icon-btn help-btn" id="btn-help" title="Keyboard Shortcuts (?)">?</button>
+      <button class="icon-btn help-btn" id="btn-about" title="About &amp; Licence">&#9432;</button>
       <input type="file" id="file-load-input" accept=".json" style="display:none" />
     </div>
   </header>
@@ -277,6 +278,27 @@
       </div>
       <div class="modal-actions">
         <button class="btn-primary" id="shortcuts-close">Got it</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- About & Licence -->
+  <div class="modal-overlay" id="modal-about" role="dialog" aria-label="About and Licence" hidden>
+    <div class="modal-box about-box">
+      <h3>About &amp; Licence</h3>
+      <dl class="about-grid">
+        <dt>Author</dt>
+        <dd>Mark Do</dd>
+        <dt>Contact</dt>
+        <dd><a href="mailto:dtcmark@gmail.com">dtcmark@gmail.com</a></dd>
+        <dt>Personal use</dt>
+        <dd>Free. Use MusicBox, and anything you make with it, for personal, study and other non commercial work. No permission needed.</dd>
+        <dt>Commercial use</dt>
+        <dd>Ask first. Client, brand, resale and any other paid work needs written permission: <a href="mailto:dtcmark@gmail.com?subject=Commercial%20use%20request">request a licence</a>.</dd>
+      </dl>
+      <p class="about-note">&copy; 2026 Mark Do. Provided as is, with no warranty.</p>
+      <div class="modal-actions">
+        <button class="btn-primary" id="about-close">Close</button>
       </div>
     </div>
   </div>
