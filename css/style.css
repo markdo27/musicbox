@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════════════════════
    MusicBox — Design System & Full UI Styles
-   Dark hardware aesthetic · LED buttons · Glassmorphism panels
+   Paper/ink "instrument" aesthetic · hairline rules · mono typography
    ═══════════════════════════════════════════════════════════════ */
 
 /* ─── CSS Custom Properties ────────────────────────────────── */
@@ -58,6 +58,7 @@
   --sidebar-left-w: 260px;
   --sidebar-right-w: 240px;
   --step-btn-size:  34px;
+  --track-header-w: 220px;
   --radius-sm:      0;
   --radius-md:      0;
   --radius-lg:      0;
@@ -637,32 +638,54 @@ body {
 
 .step-indicator-row {
   display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-bottom: 4px;
+  /* Match the track row's horizontal padding so the columns line up. */
+  padding: 0 8px;
+}
+
+/* Mirrors .track-header so the bar numbers sit over their columns. */
+.step-indicator-spacer {
+  width: var(--track-header-w);
+  flex-shrink: 0;
+}
+
+.step-indicator-grid {
+  display: flex;
   gap: 2px;
   flex: 1;
-  padding-left: 220px; /* align with track steps */
+  min-width: 0;
 }
 
 .step-indicator {
-  flex: 1;
-  height: 6px;
+  flex: 1 1 0;
+  min-width: var(--step-btn-size);
+  height: 13px;
   background: var(--bg-elevated);
   border-radius: 0;
+  border: 1px solid var(--border-subtle);
   font-family: var(--font-mono);
-  font-size: 8px;
+  font-size: 9px;
+  line-height: 1;
   color: var(--text-muted);
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.05s;
+  transition: background 0.05s, color 0.05s;
+  overflow: hidden;
+}
+
+.step-indicator.bar-start {
+  border-left: 2px solid var(--border-muted);
+  color: var(--text-secondary);
 }
 
 .step-indicator.playhead {
   background: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  color: #ffffff;
   box-shadow: none;
-}
-
-.step-indicator.bar-start {
-  background: var(--bg-elevated);
 }
 
 /* ─── TRACK LIST ────────────────────────────────────────────── */
@@ -671,7 +694,7 @@ body {
   flex-direction: column;
   gap: 4px;
   overflow-y: auto;
-  flex: 1;
+  flex: 0 0 auto;
 }
 
 .track-row {
@@ -699,9 +722,9 @@ body {
   background: rgba(161,98,7,0.04);
 }
 
-/* Track header (left side, 220px wide) */
+/* Track header (left side) */
 .track-header {
-  width: 220px;
+  width: var(--track-header-w);
   flex-shrink: 0;
   display: flex;
   align-items: center;
@@ -814,12 +837,19 @@ body {
   gap: 2px;
   flex: 1;
   align-items: center;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  padding-bottom: 2px;
 }
 
 .step-btn {
   width: var(--step-btn-size);
+  min-width: var(--step-btn-size);
   height: var(--step-btn-size);
-  flex: 1;
+  /* Grow to fill the row, but never shrink below the legible minimum. */
+  flex: 1 1 0;
   border-radius: 0;
   border: 1px solid var(--border-subtle);
   background: var(--led-off);
@@ -893,14 +923,10 @@ body {
 
 .step-btn.has-prob .step-prob-dot { opacity: 0.8; }
 
-/* Bar dividers */
-.step-btn:nth-child(4n+1):not(:first-child)::after {
-  content: '';
-  position: absolute;
-  left: -2px;
-  top: 20%; bottom: 20%;
-  width: 1px;
-  background: var(--border-muted);
+/* Bar dividers — drawn as a left border so they never collide with the
+   slide pip (which used the ::after pseudo-element). */
+.step-btn:nth-child(4n+1):not(:first-child) {
+  border-left: 2px solid var(--border-muted);
 }
 
 /* ── Accent: amber top border + glow ─────────────────────────── */
@@ -1178,6 +1204,8 @@ body {
   border-radius: 0;
   z-index: 2;
   cursor: pointer;
+  /* Centre the key on the white-key boundary it straddles. */
+  transform: translateX(-50%);
 }
 
 .key.active-key {
@@ -1877,7 +1905,6 @@ kbd {
   transform: translateX(-50%) scaleY(0.95);
   transform-origin: top center;
 }
-
 /* ─── Step Editor Hint ───────────────────────────────────────── */
 .hint-text {
   color: var(--text-muted);
@@ -1958,3 +1985,411 @@ kbd {
 /* Beat-boundary cells get a stronger left rule, as the bar lines did before. */
 .step-btn:nth-child(4n+1){border-left-color:var(--text-muted)}
 
+
+/* ═══════════════════════════════════════════════════════════════
+   GENERATOR PANEL
+   The centre column used to end in ~400px of dead space. The generator
+   fills it and, more importantly, turns "Randomize" from a black box
+   into a controllable instrument.
+   ═══════════════════════════════════════════════════════════════ */
+
+.generator-panel {
+  flex: 1 1 auto;
+  min-height: 230px;
+  gap: 10px;
+  padding: 12px 14px;
+}
+
+.gen-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.gen-seed-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+}
+
+.gen-seed {
+  width: 110px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 3px 6px;
+  border: 1px solid var(--border-muted);
+  background: var(--bg-base);
+  color: var(--text-primary);
+}
+
+.gen-body {
+  display: grid;
+  grid-template-columns: minmax(320px, 1fr) minmax(240px, 380px);
+  gap: 16px;
+  align-items: stretch;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.gen-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 6px 14px;
+  align-content: start;
+}
+
+.gen-subrow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.gen-subrow > span {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  width: 15px;
+  text-align: center;
+}
+
+.gen-subrow input[type="range"] {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.gen-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.gen-row > label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  width: 74px;
+  flex-shrink: 0;
+}
+
+/* Rows that carry more than one control span two grid columns. */
+.gen-row-wide { grid-column: span 2; }
+
+.gen-row select {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 3px 4px;
+  border: 1px solid var(--border-muted);
+  background: var(--bg-base);
+  color: var(--text-primary);
+}
+
+.gen-row input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent-cyan);
+}
+
+.gen-row .gen-val {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+  width: 56px;
+  flex-shrink: 0;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gen-preview {
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+}
+
+.gen-preview-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.gen-preview-info {
+  color: var(--text-secondary);
+  text-transform: none;
+  letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gen-preview-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.gen-preview-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  flex: 1 1 0;
+  min-height: 16px;
+  cursor: pointer;
+}
+
+.gen-preview-row-label {
+  width: 72px;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.3;
+  color: var(--text-muted);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.gen-preview-row.selected .gen-preview-row-label {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.gen-preview-row.selected {
+  outline: 1px solid var(--text-primary);
+  outline-offset: 1px;
+}
+
+.gen-preview-cells {
+  display: flex;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+.gen-cell {
+  flex: 1 1 0;
+  min-width: 3px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  position: relative;
+}
+.gen-cell.on {
+  background: rgba(14,116,144,0.25);
+  border-color: var(--accent-cyan);
+}
+
+.gen-cell.on::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: var(--h, 50%);
+  background: var(--accent-cyan);
+  opacity: 0.55;
+}
+
+.gen-cell.accent { border-top: 2px solid var(--accent-amber); }
+.gen-cell.slide { border-right: 2px solid var(--accent-green); }
+.gen-cell.prob  { border-bottom: 2px dotted var(--accent-amber); }
+
+.gen-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.gen-actions > button,
+.gen-actions > select {
+  flex: 0 0 auto;
+}
+
+.gen-hint {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.gen-actions select {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 4px;
+  border: 1px solid var(--border-muted);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  max-width: 150px;
+}
+
+/* ─── MIXER: real master level meter ─────────────────────────── */
+.mixer-master {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 8px;
+  margin-top: 4px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.mixer-master-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.master-meter {
+  flex: 1;
+  height: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  position: relative;
+  overflow: hidden;
+}
+
+.master-meter-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent-green) 0%, var(--accent-amber) 72%, var(--accent-red) 100%);
+  transition: width 0.05s linear;
+}
+
+/* ─── TRACK HEADER: mode + output selects ────────────────────── */
+.track-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.track-meta select {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  padding: 1px 2px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  max-width: 74px;
+}
+
+.track-mode-select { max-width: 78px; }
+.track-out-select { max-width: 60px; }
+
+/* ─── DEVICE CARDS as buttons ────────────────────────────────── */
+button.device-card {
+  width: 100%;
+  text-align: left;
+  font-family: var(--font-ui);
+  color: inherit;
+  cursor: pointer;
+  appearance: none;
+}
+
+button.device-card:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+button.device-card.device-selected {
+  border-color: var(--text-primary);
+  box-shadow: inset 0 0 0 1px var(--text-primary);
+}
+
+button.device-card:not(:disabled):hover {
+  border-color: var(--text-primary);
+}
+
+.device-card-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* ─── RESPONSIVE ───────────────────────────────────────────────
+   The app used to have zero media queries: on any screen narrower
+   than ~1100px the two sidebars squeezed the step grid into
+   unusability, and on a phone it was unusable outright. */
+@media (max-width: 1400px) {
+  .gen-body { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 1200px) {
+  :root {
+    --sidebar-left-w: 220px;
+    --sidebar-right-w: 210px;
+    --step-btn-size: 30px;
+    --track-header-w: 190px;
+  }
+  .step-indicator-row { padding-left: calc(var(--track-header-w) + 14px); }
+}
+
+@media (max-width: 1000px) {
+  .app-main {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr;
+  }
+  .sidebar-left,
+  .sidebar-right {
+    position: absolute;
+    top: 0; bottom: 0;
+    width: 260px;
+    z-index: 40;
+    background: var(--bg-panel);
+    transition: transform 0.2s;
+  }
+  .sidebar-left { left: 0; transform: translateX(-100%); }
+  .sidebar-right { right: 0; transform: translateX(100%); }
+  .sidebar-left.open, .sidebar-right.open { transform: translateX(0); }
+  .sequencer-area { padding: 8px; }
+}
+
+@media (max-width: 640px) {
+  :root {
+    --header-h: 108px;
+    --step-btn-size: 26px;
+    --track-header-w: 150px;
+  }
+  .gen-controls { grid-template-columns: 1fr 1fr; }
+  .gen-row > label { width: 58px; }
+  .app-header { flex-wrap: wrap; height: var(--header-h); }
+  .transport { flex-wrap: wrap; }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "musicbox",
+  "version": "2.0.0",
+  "description": "Browser-native generative step sequencer and MIDI controller",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test": "node tests/generate.test.mjs && node tests/dom.test.mjs && node tests/smoke.test.mjs",
+    "test:generate": "node tests/generate.test.mjs",
+    "test:dom": "node tests/dom.test.mjs",
+    "test:smoke": "node tests/smoke.test.mjs",
+    "test:browser": "node tests/browser.test.mjs",
+    "test:all": "node tests/generate.test.mjs && node tests/dom.test.mjs && node tests/smoke.test.mjs && node tests/browser.test.mjs",
+    "serve": "npx --yes http-server -p 8080 -c-1 ."
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
