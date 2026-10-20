@@ -122,6 +122,61 @@ feedforward — not biquads, which cannot produce true allpass phase.
 
 ---
 
+## 3a. Per-track channel strips
+
+Every track has its own strip. The global delay and reverb are still fed
+by the master, so the master send behaves as before; the per-track sends
+**add** to them, the way a DAW's global bus and per-track sends coexist.
+
+```
+voice ──► EQ low ──► EQ mid ──► EQ high ──► saturation ──► track gain ──┬──► master
+                                                                       ├──► delay send  ──► delay bus
+                                                                       └──► reverb send ──► reverb bus
+```
+
+| Control | Range | Filter | Frequency |
+|---|---|---|---|
+| **EQ low** | −12…+12 dB | low shelf | 80 Hz |
+| **EQ mid** | −12…+12 dB | peaking, Q 0.9 | 900 Hz |
+| **EQ high** | −12…+12 dB | high shelf | 4 kHz |
+| **Sat** | 0–1 | `tanh(x × (1 + drive × 18))` waveshaper, 2× oversampled | — |
+| **Dly / Rev** | 0–1 | send level to the shared buses | — |
+
+The **track gain** (the mixer fader) sits *after* the strip, so the
+insert FX are pre-fader — which is what a hardware channel strip does.
+
+The saturation curve is rebuilt only when the amount changes, not per
+note, so a busy pattern does not allocate a `Float32Array` per hit.
+
+---
+
+## 3b. Recording to WAV
+
+The **🎙 REC** button taps the master bus and exports a 16-bit stereo WAV.
+
+- The tap is an **`AudioWorklet`**, not a `ScriptProcessor` — the latter
+  runs on the main thread and glitters under load.
+- The worklet is connected to a **zero-gain sink** that reaches the
+  destination. This is required: a node that is not connected to the
+  destination is not pulled by the rendering thread, and the worklet would
+  never be called. The sink contributes nothing audible.
+- The worklet's input is `channelCount: 2`, `channelCountMode: 'explicit'`,
+  so the file is a standard stereo WAV.
+- Samples are collected per render quantum and merged on stop, then
+  encoded to a 44-byte RIFF header plus 16-bit interleaved PCM.
+
+The header is verified byte-for-byte in `tests/browser.test.mjs`:
+`RIFF`/`WAVE`/`fmt ` magic, the channel count, the sample rate, the bit
+depth, the data-chunk size, and that the file length matches the header.
+
+> **Headless testing note.** The browser suite launches Chrome with
+> `--autoplay-policy=no-user-gesture-required`. Without it the
+> `AudioContext` stays *suspended* (no user gesture), nothing renders, and
+> the capture worklet never runs — the WAV test would silently pass
+> against an empty file.
+
+---
+
 ## 4. MIDI Controller Half
 
 ### Clock
@@ -245,7 +300,28 @@ every bar.
 
 ---
 
-## 6. Verification
+## 7. Pattern bank & song arranger
+
+The bank holds **8 slots**. Each slot is a full 8-track pattern.
+
+- Slots and the edit buffer are **deep-copied** in both directions, so
+  editing one can never mutate another. (A shared-reference bug here
+  would silently corrupt a saved pattern.)
+- The edit buffer is `state.tracks`; the scheduler reads
+  `_activeTracks(absIndex)`:
+  - song mode **off** → the edit buffer plays;
+  - song mode **on** → the slot the arrangement assigns to that bar plays.
+
+The bar is derived from the **absolute step index being scheduled**, not
+from the transport position, so the look-ahead window does not play the
+previous bar's slot over the bar line.
+
+The arrangement is a list of slot indices, one per bar, and resizing it
+(8 / 16 / 32 bars) preserves the bars that were already there.
+
+---
+
+## 8. Verification
 
 The synthesis model is a pure function, so it can be tested without
 rendering audio:
@@ -267,4 +343,5 @@ npm test
 
 `tests/browser.test.mjs` additionally drives the real app in headless
 Chrome and asserts the parameter panel, the learn badges and the clock
-switch behave as documented above.
+switch behave as documented above — and validates the WAV header byte
+for byte.

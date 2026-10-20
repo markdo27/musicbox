@@ -1252,6 +1252,16 @@ const UI = (() => {
     { key: 'tune',      id: 'synth-tune',      scale: 1,   suffix: 'st', cc: null },
   ];
 
+  // The per-track insert FX (channel strip).
+  const FX_PARAM_MAP = [
+    { key: 'eqLow',      id: 'fx-eq-low',      scale: 1,   suffix: 'dB', cc: null },
+    { key: 'eqMid',      id: 'fx-eq-mid',      scale: 1,   suffix: 'dB', cc: null },
+    { key: 'eqHigh',     id: 'fx-eq-high',     scale: 1,   suffix: 'dB', cc: null },
+    { key: 'drive',      id: 'fx-drive',       scale: 100, suffix: '%',  cc: 'drive' },
+    { key: 'sendDelay',  id: 'fx-send-delay',  scale: 100, suffix: '%',  cc: null },
+    { key: 'sendReverb', id: 'fx-send-reverb', scale: 100, suffix: '%',  cc: null },
+  ];
+
   let _synthTrackIdx = 4;   // the 303 track by default
 
   function renderSynthPanel() {
@@ -1283,16 +1293,34 @@ const UI = (() => {
 
   function syncSynthPanel() {
     const params = window.AudioEngine ? AudioEngine.getTrackParams(_synthTrackIdx) : null;
-    if (!params) return;
-    SYNTH_PARAM_MAP.forEach(m => {
-      const el = document.getElementById(m.id);
-      const lbl = document.getElementById(m.id + '-val');
-      if (!el) return;
-      const v = params[m.key];
-      if (document.activeElement !== el) el.value = String(Math.round(v * m.scale));
-      if (lbl) lbl.textContent = (m.key === 'tune' ? v : Math.round(v * m.scale)) + m.suffix;
-    });
-    if (window.MidiLearn) MidiLearn.decorate(document.getElementById('panel-synth'));
+    if (params) {
+      SYNTH_PARAM_MAP.forEach(m => {
+        const el = document.getElementById(m.id);
+        const lbl = document.getElementById(m.id + '-val');
+        if (!el) return;
+        const v = params[m.key];
+        if (document.activeElement !== el) el.value = String(Math.round(v * m.scale));
+        if (lbl) lbl.textContent = (m.key === 'tune' ? v : Math.round(v * m.scale)) + m.suffix;
+      });
+    }
+    const fx = window.AudioEngine ? AudioEngine.getTrackFx(_synthTrackIdx) : null;
+    if (fx) {
+      FX_PARAM_MAP.forEach(m => {
+        const el = document.getElementById(m.id);
+        const lbl = document.getElementById(m.id + '-val');
+        if (!el) return;
+        const v = fx[m.key];
+        if (document.activeElement !== el) el.value = String(Math.round(v * m.scale));
+        if (lbl) {
+          lbl.textContent = m.suffix === 'dB'
+            ? (v > 0 ? '+' : '') + v.toFixed(1) + 'dB'
+            : Math.round(v * m.scale) + m.suffix;
+        }
+      });
+    }
+    if (window.MidiLearn) {
+      MidiLearn.decorate(document.getElementById('panel-synth'));
+    }
   }
 
   function getSynthTrackIdx() { return _synthTrackIdx; }
@@ -1301,6 +1329,230 @@ const UI = (() => {
     const sel = document.getElementById('synth-track');
     if (sel) sel.value = String(_synthTrackIdx);
     syncSynthPanel();
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // VARIATIONS PICKER
+  // ═══════════════════════════════════════════════════════════════
+  // "Generate 16" and *choose* one, rather than accepting whatever the
+  // first dice roll produced. This is the single best generative UX in
+  // the market (Ableton's Generate, Elektron's pattern randomiser).
+
+  let _variationPatches = [];
+  let _variationIndex = 0;
+  let _variationBaseSeed = '';
+
+  /** Draw a patch into a canvas thumbnail. */
+  function _renderVariationCanvas(canvas, patch) {
+    const cols = patch.stepCount || 16;
+    const rows = patch.tracks.length;
+    const cw = 5, ch = 5;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = cols * cw * dpr;
+    canvas.height = rows * ch * dpr;
+    canvas.style.width = (cols * cw) + 'px';
+    canvas.style.height = (rows * ch) + 'px';
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cols * cw, rows * ch);
+    patch.tracks.forEach((track, r) => {
+      track.steps.forEach((st, c) => {
+        if (!st.active) return;
+        ctx.fillStyle = st.accent ? '#a16207' : st.slide ? '#15803d' : '#0e7490';
+        ctx.fillRect(c * cw, r * ch, cw - 1, ch - 1);
+      });
+    });
+  }
+
+  function openVariations() {
+    const g = window.Generator;
+    if (!g) return;
+    const params = _genReadParams();
+    if (!params) return;
+    _variationBaseSeed = params.seed || g.randomSeedString();
+    _variationPatches = g.generateVariations({ ...params, seed: _variationBaseSeed }, 16);
+    _variationIndex = 0;
+    _renderVariations();
+    const modal = document.getElementById('modal-variations');
+    if (modal) modal.hidden = false;
+    const info = document.getElementById('variations-info');
+    if (info) info.textContent = `16 candidates from seed ${_variationBaseSeed}`;
+  }
+
+  function _renderVariations() {
+    const grid = document.getElementById('variations-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    _variationPatches.forEach((patch, i) => {
+      const cell = document.createElement('button');
+      cell.type = 'button';
+      cell.className = 'variation' + (i === _variationIndex ? ' selected' : '');
+
+      const canvas = document.createElement('canvas');
+      canvas.className = 'variation-canvas';
+      _renderVariationCanvas(canvas, patch);
+
+      const hits = patch.tracks.reduce((n, t) => n + t.steps.filter(s => s.active).length, 0);
+      const meta = document.createElement('div');
+      meta.className = 'variation-meta';
+      meta.textContent = `${String(i + 1).padStart(2, '0')} · ${hits} hits`;
+
+      cell.appendChild(canvas);
+      cell.appendChild(meta);
+      cell.addEventListener('click', () => _applyVariation(i));
+      cell.addEventListener('mouseenter', () => { _variationIndex = i; _highlightVariation(i); });
+      grid.appendChild(cell);
+    });
+  }
+
+  function _highlightVariation(i) {
+    const grid = document.getElementById('variations-grid');
+    if (!grid) return;
+    grid.querySelectorAll('.variation').forEach((el, idx) => {
+      el.classList.toggle('selected', idx === i);
+    });
+  }
+
+  function moveVariationSelection(delta) {
+    if (!_variationPatches.length) return;
+    _variationIndex = (_variationIndex + delta + _variationPatches.length) % _variationPatches.length;
+    _highlightVariation(_variationIndex);
+    const grid = document.getElementById('variations-grid');
+    const sel = grid?.querySelector('.variation.selected');
+    if (sel) sel.scrollIntoView({ block: 'nearest' });
+  }
+
+  function applySelectedVariation() {
+    _applyVariation(_variationIndex);
+  }
+
+  function _applyVariation(i) {
+    const patch = _variationPatches[i];
+    if (!patch) return;
+    Sequencer.applyPatch(patch);
+    UI.renderSequencer(Sequencer.getState());
+    UI.renderInstruments();
+    UI.syncControls(Sequencer.getState());
+    // The chosen candidate's own seed goes in the field, so exactly this
+    // result can be reproduced later.
+    const seedEl = document.getElementById('gen-seed');
+    if (seedEl) seedEl.value = patch.meta.seed || '';
+    const params = Sequencer.getGenerativeParams();
+    if (params) Sequencer.setGenerativeParams({ ...params, seed: patch.meta.seed });
+    closeVariations();
+    showToast(`Applied variation ${i + 1} of 16 — seed ${patch.meta.seed}`, 'success');
+  }
+
+  function closeVariations() {
+    const modal = document.getElementById('modal-variations');
+    if (modal) modal.hidden = true;
+  }
+
+  function isVariationsOpen() {
+    const modal = document.getElementById('modal-variations');
+    return !!(modal && !modal.hidden);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // PATTERN BANK + SONG ARRANGER
+  // ═══════════════════════════════════════════════════════════════
+  // Eight pattern slots, and an arrangement that chains them across bars.
+  // In song mode the ARRANGEMENT decides what sounds — so the grid can be
+  // showing slot B while slot A plays.
+
+  let _songPaint = null;   // { slot, active } while dragging the strip
+
+  function renderPatternBank() {
+    const container = document.getElementById('pattern-slots');
+    if (!container) return;
+    const bank = Sequencer.getBank();
+    const song = Sequencer.getSong();
+
+    container.innerHTML = '';
+    bank.slots.forEach((slot, i) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'slot-pad'
+        + (i === bank.activeSlot ? ' active' : '')
+        + (slot.tracks ? ' filled' : '');
+      btn.textContent = slot.name;
+      btn.title = slot.tracks
+        ? `Slot ${slot.name} — saved ${new Date(slot.savedAt).toLocaleTimeString()}`
+        : `Slot ${slot.name} — empty`;
+      btn.addEventListener('click', () => {
+        Sequencer.setActiveSlot(i);
+        renderPatternBank();
+      });
+      // Right-click saves the current buffer into the slot.
+      btn.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        Sequencer.saveToSlot(i);
+        renderPatternBank();
+        showToast(`Saved to slot ${slot.name}`, 'success');
+      });
+      container.appendChild(btn);
+    });
+
+    const toggle = document.getElementById('song-enabled');
+    if (toggle) toggle.checked = !!song.enabled;
+    const bars = document.getElementById('song-bars');
+    if (bars) bars.value = String(song.bars);
+
+    renderSong();
+  }
+
+  function renderSong() {
+    const strip = document.getElementById('song-strip');
+    if (!strip) return;
+    const song = Sequencer.getSong();
+    const bank = Sequencer.getBank();
+
+    strip.innerHTML = '';
+    for (let bar = 0; bar < song.bars; bar++) {
+      const slotIdx = song.arrangement[bar] || 0;
+      const cell = document.createElement('div');
+      cell.className = 'song-cell' + (song.enabled ? ' enabled' : '');
+      cell.dataset.bar = String(bar);
+      cell.textContent = bank.slots[slotIdx]?.name || 'A';
+      cell.title = `Bar ${bar + 1} → slot ${bank.slots[slotIdx]?.name} — click to change`;
+
+      cell.addEventListener('click', () => {
+        const next = (slotIdx + 1) % bank.slots.length;
+        Sequencer.setArrangementBar(bar, next);
+        renderSong();
+      });
+
+      // Drag across the strip to paint a slot across several bars.
+      cell.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        const next = (slotIdx + 1) % bank.slots.length;
+        _songPaint = { slot: next };
+        Sequencer.setArrangementBar(bar, next);
+        renderSong();
+      });
+      cell.addEventListener('mouseenter', () => {
+        if (!_songPaint) return;
+        const bar2 = parseInt(cell.dataset.bar, 10);
+        if (Sequencer.getSong().arrangement[bar2] !== _songPaint.slot) {
+          Sequencer.setArrangementBar(bar2, _songPaint.slot);
+          renderSong();
+        }
+      });
+      strip.appendChild(cell);
+    }
+    updateSongPlayhead(Sequencer.currentSongBar());
+  }
+
+  function endSongPaint() { _songPaint = null; }
+
+  /** Highlight the bar that is currently playing. */
+  function updateSongPlayhead(bar) {
+    const strip = document.getElementById('song-strip');
+    if (!strip) return;
+    strip.querySelectorAll('.song-cell').forEach(el => {
+      el.classList.toggle('playing', parseInt(el.dataset.bar, 10) === bar);
+    });
   }
 
   // ─── Utility ──────────────────────────────────────────────────
@@ -1330,7 +1582,17 @@ const UI = (() => {
     syncSynthPanel,
     getSynthTrackIdx,
     setSynthTrackIdx,
+    openVariations,
+    closeVariations,
+    isVariationsOpen,
+    moveVariationSelection,
+    applySelectedVariation,
+    renderPatternBank,
+    renderSong,
+    updateSongPlayhead,
+    endSongPaint,
     SYNTH_PARAM_MAP,
+    FX_PARAM_MAP,
     TRACK_COLORS,
     syncSpatialSliders,
     getCurrentStepEditing: () => currentStepBeingEdited,

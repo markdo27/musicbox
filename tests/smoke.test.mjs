@@ -627,6 +627,90 @@ eq('namespaced sampler type detected', AudioEngine.isSamplerType('strudel:drum')
 }
 
 // ═══════════════════════════════════════════════════════════════
+// PATTERN BANK + SONG ARRANGER
+// ═══════════════════════════════════════════════════════════════
+{
+  const bank = Sequencer.getBank();
+  const song = Sequencer.getSong();
+
+  eq('the bank has 8 slots', bank.slots.length, 8);
+  eq('the song defaults to 16 bars', song.bars, 16);
+  ok('song mode is off by default', song.enabled === false);
+
+  // Save the current buffer into slot A, then change it and come back.
+  Sequencer.toggleStep(0, 0);            // make the kick distinctive
+  const mark = JSON.stringify(Sequencer.getTracks().map(t => t.steps));
+  ok('saveToSlot works', Sequencer.saveToSlot(0) === true);
+  ok('slot A now holds a pattern', !!bank.slots[0].tracks);
+
+  // Change the buffer.
+  Sequencer.toggleStep(0, 0);            // undo the mark
+  const changed = JSON.stringify(Sequencer.getTracks().map(t => t.steps));
+  ok('the buffer changed', changed !== mark);
+
+  // Load slot A back.
+  ok('loadFromSlot works', Sequencer.loadFromSlot(0) === true);
+  eq('loading a slot restores its pattern',
+     JSON.stringify(Sequencer.getTracks().map(t => t.steps)), mark);
+
+  // Slots must not share step objects with the edit buffer.
+  const slotStep = bank.slots[0].tracks[0].steps[0];
+  const editStep = Sequencer.getTracks()[0].steps[0];
+  ok('a slot does not share step objects with the buffer', slotStep !== editStep);
+
+  // Editing the buffer must not mutate the saved slot.
+  Sequencer.toggleStep(1, 1);
+  ok('editing the buffer does not mutate the slot',
+     bank.slots[0].tracks[1].steps[1].active !== Sequencer.getTracks()[1].steps[1].active ||
+     bank.slots[0].tracks[1].steps[1].active === false);
+
+  // Song mode: the arrangement decides what plays.
+  Sequencer.toggleStep(0, 0);            // make slot B's kick differ from A's
+  Sequencer.saveToSlot(1);
+  const slotATrack = bank.slots[0].tracks[0].steps[0].active;
+  const slotBTrack = bank.slots[1].tracks[0].steps[0].active;
+  ok('the two slots differ', slotATrack !== slotBTrack);
+
+  Sequencer.setSongEnabled(true);
+  ok('song mode is on', Sequencer.getSong().enabled === true);
+
+  // Bar 0 → slot A, bar 1 → slot B.
+  Sequencer.setArrangementBar(0, 0);
+  Sequencer.setArrangementBar(1, 1);
+  eq('bar 0 plays slot A',
+     Sequencer.getActiveTracks(0)[0].steps[0].active, slotATrack);
+  eq('bar 1 plays slot B',
+     Sequencer.getActiveTracks(16)[0].steps[0].active, slotBTrack);
+  eq('bar 2 wraps to the arrangement',
+     Sequencer.getActiveTracks(32)[0].steps[0].active,
+     Sequencer.getActiveTracks(0)[0].steps[0].active);
+
+  // Turning song mode off returns to the edit buffer.
+  Sequencer.setSongEnabled(false);
+  eq('with song mode off the buffer plays',
+     Sequencer.getActiveTracks(0)[0].steps[0].active,
+     Sequencer.getTracks()[0].steps[0].active);
+
+  // Resizing the arrangement keeps what was there.
+  Sequencer.setSongEnabled(true);
+  Sequencer.setSongBars(32);
+  eq('the arrangement grew to 32 bars', Sequencer.getSong().bars, 32);
+  eq('the arrangement length matches the bar count',
+     Sequencer.getSong().arrangement.length, 32);
+  eq('the existing bars survived the resize',
+     Sequencer.getSong().arrangement[1], 1);
+
+  Sequencer.setSongBars(8);
+  eq('the arrangement shrank to 8 bars', Sequencer.getSong().arrangement.length, 8);
+
+  // Range assignment.
+  Sequencer.setArrangementRange(2, 5, 3);
+  eq('a range assignment wrote 4 bars',
+     JSON.stringify([2, 3, 4, 5].map(b => Sequencer.getSong().arrangement[b])),
+     JSON.stringify([3, 3, 3, 3]));
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Report
 // ═══════════════════════════════════════════════════════════════
 console.log('\n  MusicBox — app smoke tests\n');

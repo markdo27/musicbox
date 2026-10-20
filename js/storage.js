@@ -29,6 +29,34 @@ const Storage = (() => {
   const CURRENT_VERSION = 2;
 
   // ─── Snapshot ────────────────────────────────────────────────
+  function _snapshotBank() {
+    const bank = Sequencer.getBank();
+    if (!bank) return null;
+    return {
+      activeSlot: bank.activeSlot,
+      slots: bank.slots.map(s => ({
+        name: s.name,
+        savedAt: s.savedAt,
+        tracks: s.tracks ? s.tracks.map(t => ({
+          name: t.name, midiChannel: t.midiChannel, muted: !!t.muted,
+          soloed: !!t.soloed, volume: t.volume, audioMode: t.audioMode || 'both',
+          midiOutputId: t.midiOutputId || null, role: t.role || null,
+          steps: t.steps.map(x => ({ ...x })),
+        })) : null,
+      })),
+    };
+  }
+
+  function _snapshotSong() {
+    const song = Sequencer.getSong();
+    if (!song) return null;
+    return {
+      enabled: !!song.enabled,
+      bars: song.bars,
+      arrangement: song.arrangement.slice(),
+    };
+  }
+
   function _buildProjectSnapshot(name = 'MusicBox Project') {
     const state = Sequencer.getState();
     return {
@@ -39,6 +67,8 @@ const Storage = (() => {
       swing: state.swing,
       stepCount: state.stepCount,
       generative: state.generative ? JSON.parse(JSON.stringify(state.generative)) : null,
+      bank: window.Sequencer ? _snapshotBank() : null,
+      song: window.Sequencer ? _snapshotSong() : null,
       tracks: state.tracks.map(t => ({
         name: t.name,
         midiChannel: t.midiChannel,
@@ -52,6 +82,7 @@ const Storage = (() => {
       })),
       instruments: window.AudioEngine ? AudioEngine.getTrackInstruments().map(i => i.type) : [],
       synthParams: window.AudioEngine ? AudioEngine.getAllTrackParams() : null,
+      trackFx: window.AudioEngine ? AudioEngine.getAllTrackFx() : null,
       spatialFX: window.AudioEngine ? AudioEngine.getSpatialFX() : null,
       masterVolume: window.AudioEngine ? AudioEngine.getMasterVolume() : 0.72,
       audioEnabled: window.AudioEngine ? AudioEngine.isEnabled() : true,
@@ -92,7 +123,10 @@ const Storage = (() => {
         })),
       }));
       p.generative = p.generative || null;
+      p.bank = p.bank || null;
+      p.song = p.song || null;
       p.synthParams = p.synthParams || null;
+      p.trackFx = p.trackFx || null;
       p.spatialFX = p.spatialFX || null;
       p.version = 2;
     }
@@ -141,6 +175,36 @@ const Storage = (() => {
       Sequencer.setStepCount(p.stepCount === 32 ? 32 : 16);
       Sequencer.initTracks(p.tracks || []);
       if (p.generative) Sequencer.setGenerativeParams(p.generative);
+      if (p.bank && Sequencer.getBank) {
+        const bank = Sequencer.getBank();
+        bank.activeSlot = p.bank.activeSlot ?? 0;
+        (p.bank.slots || []).forEach((s, i) => {
+          if (!bank.slots[i]) return;
+          bank.slots[i].name = s.name || bank.slots[i].name;
+          bank.slots[i].savedAt = s.savedAt || null;
+          bank.slots[i].tracks = s.tracks
+            ? s.tracks.map(t => ({ ...t, steps: t.steps.map(x => ({ ...x })) }))
+            : null;
+        });
+      }
+      if (p.song && Sequencer.getSong) {
+        const song = Sequencer.getSong();
+        song.enabled = !!p.song.enabled;
+        song.bars = [8, 16, 32].includes(p.song.bars) ? p.song.bars : 16;
+        song.arrangement = new Array(song.bars).fill(0);
+        (p.song.arrangement || []).forEach((v, i) => {
+          if (i < song.arrangement.length) song.arrangement[i] = v;
+        });
+      }
+      if (p.trackFx && window.AudioEngine) {
+        p.trackFx.forEach((fx, idx) => {
+          if (!fx) return;
+          Object.entries(fx).forEach(([key, value]) => {
+            AudioEngine.setTrackFx(idx, key, value);
+          });
+        });
+        if (window.UI && UI.syncSynthPanel) UI.syncSynthPanel();
+      }
       if (p.synthParams && window.AudioEngine) {
         p.synthParams.forEach((params, idx) => {
           if (!params) return;
