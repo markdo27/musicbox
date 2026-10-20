@@ -359,6 +359,7 @@
         document.getElementById('btn-play').textContent = '▶';
         // Close any open modals
         document.getElementById('modal-shortcuts').hidden = true;
+        document.getElementById('modal-about').hidden = true;
         break;
       case 'KeyR':
         if (e.ctrlKey || e.metaKey) { e.preventDefault(); document.getElementById('btn-record').click(); }
@@ -401,6 +402,17 @@
     document.getElementById('modal-shortcuts').hidden = true;
   });
   document.getElementById('modal-shortcuts').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) e.currentTarget.hidden = true;
+  });
+
+  // ─── About & Licence Modal ────────────────────────────────────
+  document.getElementById('btn-about').addEventListener('click', () => {
+    document.getElementById('modal-about').hidden = false;
+  });
+  document.getElementById('about-close').addEventListener('click', () => {
+    document.getElementById('modal-about').hidden = true;
+  });
+  document.getElementById('modal-about').addEventListener('click', (e) => {
     if (e.target === e.currentTarget) e.currentTarget.hidden = true;
   });
 

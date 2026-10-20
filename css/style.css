@@ -1886,6 +1886,45 @@ kbd {
   padding: 16px;
 }
 
+/* ─── About & Licence ────────────────────────────────────────── */
+.about-box { max-width: 460px; }
+
+.about-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px 16px;
+  margin: 16px 0;
+  align-items: baseline;
+}
+.about-grid dt {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.about-grid dd {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.about-grid a {
+  color: var(--accent-cyan);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent-cyan);
+}
+.about-grid a:hover {
+  background: var(--text-primary);
+  color: var(--bg-deep);
+}
+
+.about-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 12px;
+}
 
 /* ═══════════════════════════════════════════════════════════════
    CIRCLE UI LAYER
@@ -1918,3 +1957,4 @@ kbd {
 .step-btn.active{border-width:1px}
 /* Beat-boundary cells get a stronger left rule, as the bar lines did before. */
 .step-btn:nth-child(4n+1){border-left-color:var(--text-muted)}
+
