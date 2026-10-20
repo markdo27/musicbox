@@ -111,14 +111,24 @@ const MIDI_IDS = [
   'midi-cc-led', 'synth-track', 'synth-params', 'synth-reset',
   'synth-cutoff', 'synth-resonance', 'synth-env', 'synth-decay',
   'synth-drive', 'synth-glide', 'synth-level', 'synth-tune',
+  'fx-params', 'fx-eq-low', 'fx-eq-mid', 'fx-eq-high',
+  'fx-drive', 'fx-send-delay', 'fx-send-reverb',
+  'btn-audio-rec', 'rec-timer',
+  'pattern-slots', 'song-strip', 'song-enabled', 'song-bars',
+  'gen-variations', 'modal-variations', 'variations-grid', 'variations-info',
+  'variations-regenerate', 'variations-cancel',
 ];
 const missingMidi = MIDI_IDS.filter(id => !htmlIds.has(id));
 ok('every MIDI controller element exists in the HTML', missingMidi.length === 0, missingMidi.join(', '));
 
-// Every synth slider must have a matching value readout.
+// Every synth / FX slider must have a matching value readout.
 const synthParams = ['cutoff', 'resonance', 'env', 'decay', 'drive', 'glide', 'level', 'tune'];
 const missingVals = synthParams.filter(p => !htmlIds.has(`synth-${p}-val`));
 ok('every synth parameter has a value readout', missingVals.length === 0, missingVals.join(', '));
+
+const fxParams = ['eq-low', 'eq-mid', 'eq-high', 'drive', 'send-delay', 'send-reverb'];
+const missingFxVals = fxParams.filter(p => !htmlIds.has(`fx-${p}-val`));
+ok('every FX parameter has a value readout', missingFxVals.length === 0, missingFxVals.join(', '));
 
 // Learnable controls must declare data-learn.
 const learnables = [...html.matchAll(/<(input|select)[^>]*id="([^"]+)"[^>]*>/g)]
@@ -158,7 +168,12 @@ const CLASSES = [
   'track-mode-select', 'track-out-select', 'device-selected',
   'clock-source-block', 'midi-learn-banner', 'midi-learn-dot',
   'midi-cc-led', 'learn-badge', 'synth-params', 'synth-row', 'synth-val',
-  'synth-track-select',
+  'synth-track-select', 'synth-subhead',
+  'variations-box', 'variations-grid', 'variation', 'variation-canvas',
+  'variation-meta', 'variations-info', 'variations-hint',
+  'pattern-slots', 'slot-pad', 'song-strip', 'song-cell',
+  'song-toggle', 'song-bars-select', 'pattern-hint',
+  'rec-toggle', 'rec-timer',
 ];
 const unstyled = CLASSES.filter(c => !css.includes(`.${c}`));
 ok('every new UI class has CSS', unstyled.length === 0, unstyled.join(', '));

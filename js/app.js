@@ -51,6 +51,10 @@
       $('clock-bar').textContent = bb.bar;
       $('clock-beat').textContent = bb.beat;
       $('clock-step').textContent = bb.step;
+      // Highlight the playing bar in the arrangement.
+      if (Sequencer.getSong().enabled) {
+        UI.updateSongPlayhead(Sequencer.currentSongBar());
+      }
     }
   });
 
@@ -225,9 +229,78 @@
   UI.renderInstruments();
   UI.renderGenerator();
   UI.renderSynthPanel();
+  UI.renderPatternBank();
   if (window.MidiLearn) MidiLearn.decorate(document);
 
-  // ─── Synth parameters ─────────────────────────────────────────
+  // ─── Pattern bank + song arranger ────────────────────────────
+  $('song-enabled').addEventListener('change', (e) => {
+    Sequencer.setSongEnabled(e.target.checked);
+    UI.renderSong();
+    UI.showToast(e.target.checked
+      ? 'Song mode: the arrangement now drives playback'
+      : 'Song mode off — the edit buffer plays', 'info');
+  });
+
+  $('song-bars').addEventListener('change', (e) => {
+    Sequencer.setSongBars(parseInt(e.target.value, 10));
+    UI.renderSong();
+  });
+
+  // End a drag-paint on the song strip.
+  document.addEventListener('mouseup', () => UI.endSongPaint());
+
+  // ─── Audio recording to WAV ──────────────────────────────────
+  const recBtn = $('btn-audio-rec');
+  const recTimerEl = $('rec-timer');
+  let recTimer = null;
+  let recStart = 0;
+
+  recBtn.addEventListener('click', async () => {
+    if (AudioEngine.isRecording()) {
+      const blob = AudioEngine.stopRecording();
+      if (recTimer) { clearInterval(recTimer); recTimer = null; }
+      recBtn.classList.remove('active');
+      recBtn.setAttribute('aria-pressed', 'false');
+      if (recTimerEl) recTimerEl.hidden = true;
+      if (blob) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `musicbox_${Date.now()}.wav`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        UI.showToast('🎙 WAV exported!', 'success');
+      } else {
+        UI.showToast('Nothing was recorded', 'error');
+      }
+      return;
+    }
+
+    const ok = await AudioEngine.startRecording();
+    if (!ok) {
+      UI.showToast('Recording is not available in this browser', 'error');
+      return;
+    }
+    recBtn.classList.add('active');
+    recBtn.setAttribute('aria-pressed', 'true');
+    recStart = performance.now();
+    if (recTimerEl) {
+      recTimerEl.hidden = false;
+      recTimerEl.textContent = '0:00';
+    }
+    if (recTimer) clearInterval(recTimer);
+    recTimer = setInterval(() => {
+      const s = Math.floor((performance.now() - recStart) / 1000);
+      if (recTimerEl) {
+        recTimerEl.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+      }
+    }, 250);
+    UI.showToast('🎙 Recording the master bus…', 'info');
+  });
+
+  // ─── Synth + FX parameters ────────────────────────────────────
   UI.SYNTH_PARAM_MAP.forEach(m => {
     const el = $(m.id);
     if (!el) return;
@@ -246,10 +319,53 @@
     });
   });
 
+  UI.FX_PARAM_MAP.forEach(m => {
+    const el = $(m.id);
+    if (!el) return;
+    el.addEventListener('input', () => {
+      const raw = parseInt(el.value, 10);
+      const v = raw / m.scale;
+      const idx = UI.getSynthTrackIdx();
+      AudioEngine.setTrackFx(idx, m.key, v);
+      const lbl = $(m.id + '-val');
+      if (lbl) {
+        lbl.textContent = m.suffix === 'dB'
+          ? (v > 0 ? '+' : '') + v.toFixed(1) + 'dB'
+          : Math.round(v * m.scale) + m.suffix;
+      }
+      const t = Sequencer.getState().tracks[idx];
+      if (t && m.cc) {
+        MidiManager.pushParamToDevice(t.midiChannel || 1, m.cc, v, t.midiOutputId);
+      }
+    });
+  });
+
   $('synth-reset').addEventListener('click', () => {
-    AudioEngine.resetTrackParams(UI.getSynthTrackIdx());
+    const idx = UI.getSynthTrackIdx();
+    AudioEngine.resetTrackParams(idx);
+    AudioEngine.resetTrackFx(idx);
     UI.syncSynthPanel();
-    UI.showToast('Synth params reset', 'info');
+    UI.showToast('Channel params reset', 'info');
+  });
+
+  // ─── 16 Variations picker ────────────────────────────────────
+  $('gen-variations').addEventListener('click', () => {
+    UI.openVariations();
+  });
+
+  $('variations-cancel').addEventListener('click', () => {
+    UI.closeVariations();
+  });
+
+  $('variations-regenerate').addEventListener('click', () => {
+    // A whole new set from a new base seed.
+    const seedEl = $('gen-seed');
+    if (seedEl && window.Generator) seedEl.value = Generator.randomSeedString();
+    UI.openVariations();
+  });
+
+  $('modal-variations').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) UI.closeVariations();
   });
 
   // Audio toggle button
@@ -518,9 +634,10 @@
         $('btn-play').click();
         break;
       case 'Escape':
+        // Close the variations picker without touching the transport.
+        if (UI.isVariationsOpen()) { UI.closeVariations(); return; }
         Sequencer.stop();
         UI.syncControls(Sequencer.getState());
-        // Close any open modals
         $('modal-shortcuts').hidden = true;
         $('modal-about').hidden = true;
         $('modal-note-picker').hidden = true;
@@ -560,6 +677,20 @@
           const modal = $('modal-shortcuts');
           modal.hidden = !modal.hidden;
         }
+    }
+
+    // The variations picker takes arrow keys while it is open.
+    if (UI.isVariationsOpen()) {
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        UI.moveVariationSelection(1);
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        UI.moveVariationSelection(-1);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        UI.applySelectedVariation();
+      }
     }
   });
 

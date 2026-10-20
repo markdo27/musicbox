@@ -52,6 +52,153 @@ const Sequencer = (() => {
   let clockSource = 'internal';
   let extStepIndex = 0;   // steps scheduled in the current external run
 
+  // ─── Pattern bank + song arranger ────────────────────────────
+  const BANK_SLOTS = 8;
+  let bank = null;
+  let song = null;
+
+  function initBank() {
+    bank = {
+      slots: Array.from({ length: BANK_SLOTS }, (_, i) => ({
+        name: String.fromCharCode(65 + i),   // A … H
+        tracks: null,                          // null = empty slot
+        savedAt: null,
+      })),
+      activeSlot: 0,
+    };
+    song = {
+      enabled: false,
+      bars: 16,
+      arrangement: new Array(16).fill(0),   // one slot index per bar
+    };
+  }
+  initBank();
+
+  /** Deep-copy a track list so slots never share step objects. */
+  function _cloneTracks(tracks) {
+    return tracks.map(t => ({ ...t, steps: t.steps.map(s => ({ ...s })) }));
+  }
+
+  /**
+   * The tracks that should sound for a given absolute step.
+   * In song mode the arrangement decides; otherwise the edit buffer does.
+   */
+  function _activeTracks(absIndex) {
+    if (song.enabled) {
+      const bar = Math.floor(absIndex / 16) % song.bars;
+      const slotIdx = song.arrangement[bar] ?? 0;
+      const slot = bank.slots[slotIdx];
+      if (slot && slot.tracks) return slot.tracks;
+      return [];
+    }
+    return state.tracks;
+  }
+
+  // ─── Bank API ─────────────────────────────────────────────────
+  function getBank() { return bank; }
+  function getSong() { return song; }
+
+  /** Copy the current edit buffer into a slot. */
+  function saveToSlot(slotIdx) {
+    if (!bank.slots[slotIdx]) return false;
+    saveUndo();
+    bank.slots[slotIdx].tracks = _cloneTracks(state.tracks);
+    bank.slots[slotIdx].savedAt = new Date().toISOString();
+    _notify(true);
+    return true;
+  }
+
+  /** Load a slot into the edit buffer. */
+  function loadFromSlot(slotIdx) {
+    const slot = bank.slots[slotIdx];
+    if (!slot) return false;
+    saveUndo();
+    if (slot.tracks) {
+      state.tracks = _cloneTracks(slot.tracks);
+    } else {
+      // An empty slot clears the buffer to a blank 8-track pattern.
+      state.tracks = state.tracks.map((t, i) => ({
+        ...t, steps: Array.from({ length: state.stepCount }, () => ({
+          active: false, note: 60, velocity: 100, gate: 0.5, probability: 100,
+          accent: false, slide: false, offset: 0, repeats: 1,
+        })),
+      }));
+    }
+    bank.activeSlot = slotIdx;
+    _notify(true);
+    return true;
+  }
+
+  /** Select a slot for editing, saving the current one first. */
+  function setActiveSlot(slotIdx) {
+    if (!bank.slots[slotIdx]) return false;
+    if (slotIdx === bank.activeSlot) return true;
+    // Preserve whatever is in the buffer if that slot has never been saved.
+    if (bank.slots[bank.activeSlot] && !bank.slots[bank.activeSlot].tracks) {
+      bank.slots[bank.activeSlot].tracks = _cloneTracks(state.tracks);
+    }
+    bank.activeSlot = slotIdx;
+    const slot = bank.slots[slotIdx];
+    if (slot.tracks) state.tracks = _cloneTracks(slot.tracks);
+    _notify(true);
+    return true;
+  }
+
+  function renameSlot(slotIdx, name) {
+    if (!bank.slots[slotIdx]) return false;
+    bank.slots[slotIdx].name = String(name || '').slice(0, 12) || String.fromCharCode(65 + slotIdx);
+    _notify(true);
+    return true;
+  }
+
+  function clearSlot(slotIdx) {
+    if (!bank.slots[slotIdx]) return false;
+    saveUndo();
+    bank.slots[slotIdx].tracks = null;
+    bank.slots[slotIdx].savedAt = null;
+    _notify(true);
+    return true;
+  }
+
+  // ─── Song API ─────────────────────────────────────────────────
+  function setSongEnabled(on) {
+    song.enabled = !!on;
+    _notify(true);
+  }
+
+  function setSongBars(bars) {
+    const n = bars === 32 ? 32 : bars === 8 ? 8 : 16;
+    song.bars = n;
+    const arr = new Array(n).fill(bank.activeSlot);
+    for (let i = 0; i < Math.min(n, song.arrangement.length); i++) arr[i] = song.arrangement[i];
+    song.arrangement = arr;
+    _notify(true);
+  }
+
+  function setArrangementBar(bar, slotIdx) {
+    if (bar < 0 || bar >= song.bars) return false;
+    if (slotIdx < 0 || slotIdx >= BANK_SLOTS) return false;
+    song.arrangement[bar] = slotIdx;
+    _notify(true);
+    return true;
+  }
+
+  function setArrangementRange(fromBar, toBar, slotIdx) {
+    if (slotIdx < 0 || slotIdx >= BANK_SLOTS) return false;
+    for (let b = Math.max(0, fromBar); b <= Math.min(song.bars - 1, toBar); b++) {
+      song.arrangement[b] = slotIdx;
+    }
+    _notify(true);
+    return true;
+  }
+
+  /** The slot currently playing, for the transport display. */
+  function currentSongBar() {
+    const abs = Math.max(0, state.playingStep >= 0 ? state.playingStep : 0);
+    return Math.floor(abs / 16) % song.bars;
+  }
+
+
   // ─── Undo / Redo history ────────────────────────────────────
   const undoStack = [];
   const redoStack = [];
@@ -77,6 +224,21 @@ const Sequencer = (() => {
         ...t,
         steps: t.steps.map(s => ({ ...s }))
       })),
+      bank: {
+        activeSlot: bank.activeSlot,
+        slots: bank.slots.map(s => ({
+          name: s.name,
+          savedAt: s.savedAt,
+          tracks: s.tracks ? s.tracks.map(t => ({
+            ...t, steps: t.steps.map(x => ({ ...x })),
+          })) : null,
+        })),
+      },
+      song: {
+        enabled: song.enabled,
+        bars: song.bars,
+        arrangement: song.arrangement.slice(),
+      },
       instruments: window.AudioEngine
         ? AudioEngine.getTrackInstruments().map(i => i.type)
         : [],
@@ -95,6 +257,22 @@ const Sequencer = (() => {
     state.stepCount = snapshot.stepCount;
     state.generative = snapshot.generative;
     state.tracks = snapshot.tracks;
+    if (snapshot.bank) {
+      bank.activeSlot = snapshot.bank.activeSlot;
+      snapshot.bank.slots.forEach((s, i) => {
+        if (!bank.slots[i]) return;
+        bank.slots[i].name = s.name;
+        bank.slots[i].savedAt = s.savedAt;
+        bank.slots[i].tracks = s.tracks
+          ? s.tracks.map(t => ({ ...t, steps: t.steps.map(x => ({ ...x })) }))
+          : null;
+      });
+    }
+    if (snapshot.song) {
+      song.enabled = snapshot.song.enabled;
+      song.bars = snapshot.song.bars;
+      song.arrangement = snapshot.song.arrangement.slice();
+    }
     if (snapshot.instruments && window.AudioEngine) {
       snapshot.instruments.forEach((type, idx) => AudioEngine.setTrackInstrument(idx, type));
     }
@@ -235,8 +413,10 @@ const Sequencer = (() => {
       if (onStepChange) onStepChange(step);
     }, uiDelay);
 
-    // Schedule MIDI + Internal Audio for all tracks
-    state.tracks.forEach((track, trackIdx) => {
+    // Schedule MIDI + Internal Audio for all tracks.
+    // In song mode the ARRANGEMENT decides what sounds, not the edit
+    // buffer — so the grid can be showing slot B while slot A plays.
+    _activeTracks(absIndex).forEach((track, trackIdx) => {
       if (!_shouldPlay(track)) return;
       const stepData = track.steps[step];
       if (!stepData || !stepData.active) return;
@@ -388,6 +568,16 @@ const Sequencer = (() => {
         track.steps = track.steps.slice(0, state.stepCount);
       }
     });
+    // The bank slots must follow the same step count.
+    bank.slots.forEach(slot => {
+      if (!slot.tracks) return;
+      slot.tracks.forEach(track => {
+        while (track.steps.length < state.stepCount) track.steps.push(_blankStep());
+        if (track.steps.length > state.stepCount) {
+          track.steps = track.steps.slice(0, state.stepCount);
+        }
+      });
+    });
     _notify(true);
   }
 
@@ -442,6 +632,16 @@ const Sequencer = (() => {
       while (track.steps.length < state.stepCount) {
         track.steps.push(_blankStep());
       }
+    });
+    // The bank slots must stay in step with the edit buffer.
+    bank.slots.forEach(slot => {
+      if (!slot.tracks) return;
+      slot.tracks.forEach(track => {
+        while (track.steps.length < state.stepCount) track.steps.push(_blankStep());
+        if (track.steps.length > state.stepCount) {
+          track.steps = track.steps.slice(0, state.stepCount);
+        }
+      });
     });
     _notify(true);
   }
@@ -725,6 +925,11 @@ const Sequencer = (() => {
     randomizeTrack, randomizeAll, applyPatch,
     setGenerativeParams, getGenerativeParams,
     setClockSource, getClockSource, resetExternalClock,
+    getBank, getSong,
+    getActiveTracks: (absIndex = 0) => _activeTracks(absIndex),
+    saveToSlot, loadFromSlot, setActiveSlot, renameSlot, clearSlot,
+    setSongEnabled, setSongBars, setArrangementBar, setArrangementRange,
+    currentSongBar,
     applyPreset,
     toggleMute, toggleSolo,
     setTrackAudioMode, setTrackMidiOutput,

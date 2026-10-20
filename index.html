@@ -60,6 +60,11 @@
           <span class="audio-toggle-icon">🔊</span>
           <span class="audio-toggle-label">AUDIO</span>
         </button>
+        <button class="audio-toggle rec-toggle" id="btn-audio-rec" title="Record the internal audio to a WAV file" aria-pressed="false">
+          <span class="audio-toggle-icon">🎙</span>
+          <span class="audio-toggle-label">REC</span>
+        </button>
+        <span class="rec-timer" id="rec-timer" hidden>0:00</span>
         <div class="master-vol-block">
           <label for="master-vol">VOL</label>
           <input type="range" id="master-vol" data-learn="Master volume" min="0" max="100" value="72" />
@@ -147,6 +152,24 @@
           <button class="btn-secondary" id="btn-randomize">🎲 Randomize</button>
           <button class="btn-secondary" id="btn-clear-all">🗑 Clear All</button>
         </div>
+      </section>
+
+      <!-- Pattern Bank + Song Arranger -->
+      <section class="panel" id="panel-pattern">
+        <h2 class="panel-title">
+          <span class="panel-icon">🗂</span> PATTERN
+          <label class="song-toggle" title="Play the arrangement instead of the edit buffer">
+            <input type="checkbox" id="song-enabled" /> SONG
+          </label>
+          <select id="song-bars" class="song-bars-select" title="Arrangement length">
+            <option value="8">8 bars</option>
+            <option value="16" selected>16 bars</option>
+            <option value="32">32 bars</option>
+          </select>
+        </h2>
+        <div class="pattern-slots" id="pattern-slots"></div>
+        <div class="song-strip" id="song-strip"></div>
+        <p class="hint-text pattern-hint">Click a slot to edit it · right-click to save the current pattern into it · click a bar to change its slot</p>
       </section>
 
       <!-- Keyboard Visualizer -->
@@ -273,6 +296,7 @@
 
         <div class="gen-actions">
           <button class="btn-primary" id="gen-generate">Generate All</button>
+          <button class="btn-secondary" id="gen-variations" title="Generate 16 candidates and pick one">16 Variations</button>
           <select id="gen-target-track" title="Target track"></select>
           <button class="btn-secondary" id="gen-generate-track">Regenerate Track</button>
           <span class="gen-hint">Click a preview row to choose which track to regenerate</span>
@@ -361,10 +385,10 @@
         </div>
       </section>
 
-      <!-- Synth parameters for the selected track -->
+      <!-- Synth + FX parameters for the selected track -->
       <section class="panel" id="panel-synth">
         <h2 class="panel-title">
-          <span class="panel-icon">⚙️</span> SYNTH
+          <span class="panel-icon">⚙️</span> CHANNEL
           <select id="synth-track" class="synth-track-select" title="Track to edit"></select>
         </h2>
         <div class="synth-params" id="synth-params">
@@ -409,6 +433,39 @@
             <span class="synth-val" id="synth-tune-val">0</span>
           </div>
         </div>
+        <div class="synth-subhead">INSERT FX</div>
+        <div class="synth-params" id="fx-params">
+          <div class="synth-row">
+            <label for="fx-eq-low">EQ low</label>
+            <input type="range" id="fx-eq-low" min="-12" max="12" value="0" data-learn="EQ low" />
+            <span class="synth-val" id="fx-eq-low-val">0.0dB</span>
+          </div>
+          <div class="synth-row">
+            <label for="fx-eq-mid">EQ mid</label>
+            <input type="range" id="fx-eq-mid" min="-12" max="12" value="0" data-learn="EQ mid" />
+            <span class="synth-val" id="fx-eq-mid-val">0.0dB</span>
+          </div>
+          <div class="synth-row">
+            <label for="fx-eq-high">EQ high</label>
+            <input type="range" id="fx-eq-high" min="-12" max="12" value="0" data-learn="EQ high" />
+            <span class="synth-val" id="fx-eq-high-val">0.0dB</span>
+          </div>
+          <div class="synth-row">
+            <label for="fx-drive">Sat</label>
+            <input type="range" id="fx-drive" min="0" max="100" value="0" data-learn="Saturation" />
+            <span class="synth-val" id="fx-drive-val">0%</span>
+          </div>
+          <div class="synth-row">
+            <label for="fx-send-delay">Dly</label>
+            <input type="range" id="fx-send-delay" min="0" max="100" value="0" data-learn="Delay send" />
+            <span class="synth-val" id="fx-send-delay-val">0%</span>
+          </div>
+          <div class="synth-row">
+            <label for="fx-send-reverb">Rev</label>
+            <input type="range" id="fx-send-reverb" min="0" max="100" value="0" data-learn="Reverb send" />
+            <span class="synth-val" id="fx-send-reverb-val">0%</span>
+          </div>
+        </div>
         <button class="btn-secondary" id="synth-reset">Reset params</button>
       </section>
     </aside>
@@ -451,6 +508,19 @@
       <div class="modal-actions">
         <button class="btn-primary" id="sp-confirm">Apply</button>
         <button class="btn-secondary" id="sp-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 16 Variations Picker -->
+  <div class="modal-overlay" id="modal-variations" role="dialog" aria-modal="true" aria-label="Variations" hidden>
+    <div class="modal-box variations-box">
+      <h3>16 Variations <span class="variations-info" id="variations-info"></span></h3>
+      <p class="hint-text variations-hint">Pick one. Arrow keys to move, Enter to apply, Esc to cancel.</p>
+      <div class="variations-grid" id="variations-grid"></div>
+      <div class="modal-actions">
+        <button class="btn-secondary" id="variations-regenerate">↻ New set</button>
+        <button class="btn-secondary" id="variations-cancel">Cancel</button>
       </div>
     </div>
   </div>

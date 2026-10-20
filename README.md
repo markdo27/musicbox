@@ -9,8 +9,8 @@
 [![Live Demo](https://img.shields.io/badge/Open_in-Chrome-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white)](#getting-started)
 [![Web MIDI](https://img.shields.io/badge/Web_MIDI-API-00d4ff?style=for-the-badge)](#midi-hardware)
 [![Web Audio](https://img.shields.io/badge/Web_Audio-API-00ff88?style=for-the-badge)](#audio-engine)
-[![Tests](https://img.shields.io/badge/tests-222_passing-16a34a?style=for-the-badge&logo=node.js&logoColor=white)](tests/)
-[![Benchmark](https://img.shields.io/badge/benchmark-8.0%2F10-16a34a?style=for-the-badge)](docs/AUDIT.md)
+[![Tests](https://img.shields.io/badge/tests-292_passing-16a34a?style=for-the-badge&logo=node.js&logoColor=white)](tests/)
+[![Benchmark](https://img.shields.io/badge/benchmark-8.25%2F10-16a34a?style=for-the-badge)](docs/AUDIT.md)
 
 </div>
 
@@ -27,16 +27,21 @@ build step, no dependencies, no accounts.
 1. **It generates, and you can steer it.** Genre, root, scale, chord
    progression, density, Euclidean rhythm, probability, accent/slide chance,
    motif length and humanisation are all live controls with a **live
-   preview**. Every result is reproducible from its **seed** — share a link
-   and someone else gets the identical pattern.
+   preview**. Press **16 Variations** and you get sixteen candidate
+   patches as thumbnails — *choose* one instead of accepting a dice roll.
+   Every result is reproducible from its **seed**; share a link and someone
+   else gets the identical pattern.
 2. **It drives real hardware properly.** Per-track output routing to
    different MIDI devices, per-track Internal/MIDI/Both switching, a
    **drift-free clock** you can run as master *or* slave, **MIDI Learn**
    (bind any control to a knob, bidirectionally), and device CC profiles
    for the TD-3, Crave, Edge, Model D and Neutron.
-3. **It's honest about what it is.** No feature is decorative. The scorecard
-   in [`docs/AUDIT.md`](docs/AUDIT.md) grades the project 3.4 → **8.0**
-   against 8 dimensions and lists exactly what is still missing.
+3. **It composes, not just loops.** An **8-slot pattern bank** and a
+   **song arranger** chain those slots across bars, so the grid can be
+   showing slot B while slot A plays. The whole thing records to **WAV**.
+
+The scorecard in [`docs/AUDIT.md`](docs/AUDIT.md) grades the project
+3.4 → **8.25** against 8 dimensions and lists exactly what is still missing.
 
 ---
 
@@ -59,6 +64,39 @@ seed.
 
 Generation is **non-destructive**: "Regenerate Track" rewrites one track and
 leaves the other seven alone.
+
+### 16 Variations
+
+Press **16 Variations** and you get **sixteen candidate patches**, each
+rendered as a thumbnail of the full 8-track pattern — accents in amber,
+slides in green. Arrow keys to move, **Enter** to apply, **Esc** to cancel.
+
+The whole set is reproducible from its base seed, so you can share "try
+these sixteen" as a single link.
+
+---
+
+## 🗂 Pattern Bank & Song
+
+The left sidebar has a **PATTERN** panel.
+
+- **8 slots (A–H).** Click a slot to edit it; right-click to save the
+  current pattern into it. Slots never share step data with the edit
+  buffer, so editing one cannot corrupt another.
+- **SONG mode** turns on the arrangement strip — an 8/16/32-bar timeline
+  where each bar points at a slot. Click a bar to change its slot, drag
+  across to paint. While song mode is on, **the arrangement decides what
+  sounds**, so the grid can be showing slot B while slot A is playing.
+- The playing bar is highlighted in the strip as it goes round.
+
+---
+
+## 🎙 Recording
+
+The **🎙 REC** button in the header captures the master bus and exports a
+**16-bit stereo WAV**. The tap is an `AudioWorklet`, so it does not
+glitch under load, and the samples are written to a zero-gain sink so the
+capture never contributes a sound of its own.
 
 ---
 
@@ -212,10 +250,12 @@ a bass synth can be driven independently.
 
 ---
 
-## ⚙️ Synth Parameters
+## ⚙️ Channel Strip
 
-Every track has a real front panel. Select a track in the **SYNTH** panel
-and dial it in.
+Every track has a real channel strip. Select a track in the **CHANNEL**
+panel and dial it in.
+
+**Voice**
 
 | Control | What it does |
 |---|---|
@@ -228,7 +268,19 @@ and dial it in.
 | **Level** | Output level |
 | **Tune** | ±12 semitones — for drums this is the 606's tuning pot |
 
-The mapping is a pure function, so it is **unit-tested** rather than
+**Insert FX**
+
+| Control | What it does |
+|---|---|
+| **EQ low / mid / high** | −12…+12 dB. An 80 Hz shelf, a 900 Hz peak and a 4 kHz shelf |
+| **Sat** | Saturation on the track |
+| **Dly / Rev** | This track's **own** send to the delay and reverb buses |
+
+The global SPATIAL FX still work — the per-track sends *add* to them, the
+same way a DAW's global bus and per-track sends coexist. That means a pad
+can sit in a lot of reverb while the kick stays dry.
+
+The voice mapping is a pure function, so it is **unit-tested** rather than
 asserted by ear. Full details: [`docs/ENGINE.md`](docs/ENGINE.md).
 
 ---
@@ -301,17 +353,17 @@ npx --yes http-server -p 8080 -c-1 .
 ## 🧪 Tests
 
 ```bash
-npm test              # 186 tests: generator, DOM wiring, headless app smoke
-npm run test:browser  #  36 tests: real headless Chrome over DevTools
-npm run test:all      # 222 tests
+npm test              # 218 tests: generator, DOM wiring, headless app smoke
+npm run test:browser  #  74 tests: real headless Chrome over DevTools
+npm run test:all      # 292 tests
 ```
 
 | Suite | Tests | Covers |
 |---|:--:|---|
-| `tests/generate.test.mjs` | 57 | PRNG determinism, Bjorklund correctness, scale theory, the in-scale guarantee, drum-note validity, humanise, 32-step coverage |
-| `tests/dom.test.mjs` | 25 | Every DOM target exists, script load order, generator + MIDI controller wiring, CSS coverage, breakpoints |
-| `tests/smoke.test.mjs` | 104 | Boot, undo/redo, generator↔sequencer, persistence round-trip, MIDI export bytes, clock behaviour, per-track routing, **MIDI Learn round trip**, **synthesis model monotonicity** |
-| `tests/browser.test.mjs` | 36 | Real Chrome: grid, generator, patch preview, mixer, keyboard, synth panel, learn badges + learn flow, clock source switch, **zero uncaught exceptions** |
+| `tests/generate.test.mjs` | 67 | PRNG determinism, Bjorklund correctness, scale theory, the in-scale guarantee, drum-note validity, humanise, 32-step coverage, **16-variation determinism** |
+| `tests/dom.test.mjs` | 26 | Every DOM target exists, script load order, generator + MIDI controller + FX + song wiring, CSS coverage, breakpoints |
+| `tests/smoke.test.mjs` | 125 | Boot, undo/redo, generator↔sequencer, persistence round-trip, MIDI export bytes, clock behaviour, per-track routing, **MIDI Learn round trip**, **synthesis model monotonicity**, **pattern bank isolation**, **song arrangement** |
+| `tests/browser.test.mjs` | 74 | Real Chrome: grid, generator, patch preview, mixer, synth + FX panel, learn flow, clock switch, **16-variation picker**, **pattern bank + song strip**, **byte-level WAV header validation**, **zero uncaught exceptions** |
 
 ---
 
@@ -325,15 +377,15 @@ musicbox/
 ├── js/
 │   ├── generate.js     # ★ Generative engine — seeded, pure, testable
 │   ├── presets.js      # Techno + Acid presets
-│   ├── audio.js        # TR-606 drums + TB-303 acid + synth voices
+│   ├── audio.js        # TR-606 drums + TB-303 acid + per-track channel strips
 │   ├── sampler.js      # Strudel sample loader (namespaced, pre-fetched)
 │   ├── midi.js         # Web MIDI — clock, routing, CC profiles
 │   ├── midilearn.js    # ★ MIDI Learn — bidirectional, persisted
-│   ├── sequencer.js    # Scheduler (absolute-time), undo/redo, state
+│   ├── sequencer.js    # Scheduler (absolute-time), undo/redo, bank, song
 │   ├── storage.js      # Versioned projects, autosave, MIDI export
-│   ├── ui.js           # Rendering — grid, generator panel, mixer, devices
+│   ├── ui.js           # Rendering — grid, generator, bank, mixer, devices
 │   └── app.js          # Entry point — wiring
-├── tests/              # 222 automated tests
+├── tests/              # 292 automated tests
 └── docs/
     ├── AUDIT.md        # ★ Scorecard, findings, roadmap, known limitations
     ├── ENGINE.md       # ★ Synthesis + MIDI reference
@@ -349,19 +401,21 @@ musicbox/
 
 - [x] Seeded generative engine with live preview and shareable seeds
 - [x] Euclidean rhythms, chord progressions, motif development, humanise
+- [x] **16-variation picker** — choose instead of accept
+- [x] **8-slot pattern bank + song arranger**
+- [x] **WAV recording** of the master bus
 - [x] Per-track MIDI output routing and Internal/MIDI/Both switching
 - [x] Drift-free MIDI clock; wired device CC profiles
 - [x] **MIDI Learn** — bidirectional, persisted
 - [x] **Master / slave clock** — follow an external MIDI clock
-- [x] **Per-track synth parameters** — cutoff, env, reso, decay, drive, glide, tune
+- [x] **Per-track channel strip** — voice parameters + 3-band EQ, saturation, sends
 - [x] Lossless versioned persistence, redo, faithful MIDI export
 - [x] Responsive layout, accessibility pass, automated test suite
-- [ ] "Generate 16 variations" picker
-- [ ] Pattern bank + song arranger
-- [ ] Per-track insert FX (EQ, saturation, chorus, sidechain)
-- [ ] Audio recording to WAV
 - [ ] LFO / modulation matrix
+- [ ] NRPN + pitch bend + aftertouch
+- [ ] Sidechain ducking driven by the kick pattern
 - [ ] 303/606 A/B against reference recordings
+- [ ] More device profiles (Elektron, Roland, Moog, Arturia)
 
 See [`docs/AUDIT.md`](docs/AUDIT.md) for the full backlog with effort estimates
 and [`docs/ENGINE.md`](docs/ENGINE.md) for the synthesis reference.

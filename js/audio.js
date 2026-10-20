@@ -69,6 +69,67 @@ const AudioEngine = (() => {
   // Per-track gain nodes (real-time Web Audio volume control)
   const trackGainNodes = new Array(8).fill(null);
 
+  // Per-track channel strips (EQ → saturation → gain → sends)
+  const trackChains = new Array(8).fill(null);
+
+  // ─── Per-track FX parameters ─────────────────────────────────
+  //   eqLow / eqMid / eqHigh : −12…+12 dB
+  //   drive                  : 0..1 saturation amount
+  //   sendDelay / sendReverb : 0..1 send level to the shared buses
+  const DEFAULT_FX = {
+    eqLow: 0, eqMid: 0, eqHigh: 0,
+    drive: 0, sendDelay: 0, sendReverb: 0,
+  };
+  const trackFx = Array.from({ length: 8 }, () => ({ ...DEFAULT_FX }));
+
+  function setTrackFx(trackIdx, key, value) {
+    if (trackIdx < 0 || trackIdx >= trackFx.length) return;
+    if (!(key in DEFAULT_FX)) return;
+    let v = Number(value);
+    if (!isFinite(v)) v = 0;
+    if (key.startsWith('eq')) v = Math.max(-12, Math.min(12, v));
+    else v = Math.max(0, Math.min(1, v));
+    trackFx[trackIdx][key] = v;
+    _applyTrackFx(trackIdx);
+  }
+
+  function getTrackFx(trackIdx) {
+    if (trackIdx < 0 || trackIdx >= trackFx.length) return { ...DEFAULT_FX };
+    return { ...trackFx[trackIdx] };
+  }
+
+  function getAllTrackFx() { return trackFx.map(p => ({ ...p })); }
+
+  function resetTrackFx(trackIdx) {
+    if (trackIdx < 0 || trackIdx >= trackFx.length) return;
+    trackFx[trackIdx] = { ...DEFAULT_FX };
+    _applyTrackFx(trackIdx);
+  }
+
+  /** Push the FX parameters into the live audio graph. */
+  function _applyTrackFx(trackIdx) {
+    const chain = trackChains[trackIdx];
+    const p = trackFx[trackIdx];
+    if (!chain || !ctx) return;
+    const t = ctx.currentTime;
+    chain.eqLow.gain.setTargetAtTime(p.eqLow, t, 0.02);
+    chain.eqMid.gain.setTargetAtTime(p.eqMid, t, 0.02);
+    chain.eqHigh.gain.setTargetAtTime(p.eqHigh, t, 0.02);
+    if (p.drive > 0.01) {
+      chain.shaper.curve = _makeDriveCurve(1 + p.drive * 18);
+      chain.shaper.oversample = '2x';
+    } else {
+      chain.shaper.curve = _makeDriveCurve(1);
+    }
+    chain.sendDelay.gain.setTargetAtTime(p.sendDelay, t, 0.02);
+    chain.sendReverb.gain.setTargetAtTime(p.sendReverb, t, 0.02);
+  }
+
+  /** Apply every track's FX (called after the graph is built). */
+  function _applyAllTrackFx() {
+    for (let i = 0; i < trackFx.length; i++) _applyTrackFx(i);
+  }
+
   // ─── Per-track synth parameters ──────────────────────────────
   // These are the "front panel" of each voice. They are exposed in the UI,
   // are MIDI-learnable, and are pushed to hardware as CC where the device
@@ -171,14 +232,6 @@ const AudioEngine = (() => {
     masterGain.gain.setValueAtTime(masterVol, ctx.currentTime);
     masterGain.connect(dcBlock);
 
-    // Per-track gain nodes: masterGain → trackGain[i] → master bus
-    for (let i = 0; i < 8; i++) {
-      const tg = ctx.createGain();
-      tg.gain.value = 1.0;
-      trackGainNodes[i] = tg;
-      tg.connect(masterGain);
-    }
-
     // Dry path
     dryGain = ctx.createGain();
     dryGain.gain.value = _dryValue();
@@ -211,6 +264,61 @@ const AudioEngine = (() => {
     reverbWetGain.connect(reverbToneFilter);
     reverbToneFilter.connect(masterAnalyser);
 
+    // ── Per-track channel strips ───────────────────────────────
+    // voice → EQ(3 band) → saturation → track gain → [dry | delay send | reverb send]
+    //
+    // The global delay/reverb are still fed by the master, so the master
+    // send behaves as before. The per-track sends ADD to it, which is how
+    // a DAW works: a global bus plus per-track sends.
+    for (let i = 0; i < 8; i++) {
+      const input = ctx.createGain();
+
+      const eqLow = ctx.createBiquadFilter();
+      eqLow.type = 'lowshelf';
+      eqLow.frequency.value = 80;
+      eqLow.gain.value = 0;
+
+      const eqMid = ctx.createBiquadFilter();
+      eqMid.type = 'peaking';
+      eqMid.frequency.value = 900;
+      eqMid.Q.value = 0.9;
+      eqMid.gain.value = 0;
+
+      const eqHigh = ctx.createBiquadFilter();
+      eqHigh.type = 'highshelf';
+      eqHigh.frequency.value = 4000;
+      eqHigh.gain.value = 0;
+
+      const shaper = ctx.createWaveShaper();
+      shaper.curve = _makeDriveCurve(1);
+      shaper.oversample = '2x';
+
+      const sendDelay = ctx.createGain();
+      sendDelay.gain.value = 0;
+      const sendReverb = ctx.createGain();
+      sendReverb.gain.value = 0;
+
+      const tg = ctx.createGain();
+      tg.gain.value = 1.0;
+
+      input.connect(eqLow);
+      eqLow.connect(eqMid);
+      eqMid.connect(eqHigh);
+      eqHigh.connect(shaper);
+      shaper.connect(tg);
+      tg.connect(masterGain);
+      tg.connect(sendDelay);
+      sendDelay.connect(delayNode.input);
+      tg.connect(sendReverb);
+      sendReverb.connect(reverbNode.input);
+
+      trackGainNodes[i] = tg;
+      trackChains[i] = { input, eqLow, eqMid, eqHigh, shaper, sendDelay, sendReverb };
+    }
+
+    // Push the initial FX values into the graph.
+    _applyAllTrackFx();
+
     return ctx;
   }
 
@@ -241,8 +349,11 @@ const AudioEngine = (() => {
     const vel = Math.max(0.02, Math.min(1, (velocity || 100) / 127));
     const instrType = _getInstrType(channel, trackIdx);
 
-    // Resolve output bus: per-track gain if available, else master
-    const outBus = (trackIdx >= 0 && trackGainNodes[trackIdx]) ? trackGainNodes[trackIdx] : masterGain;
+    // Resolve output bus: the track's channel strip input, so the EQ,
+    // saturation and sends apply to this track only.
+    const outBus = (trackIdx >= 0 && trackChains[trackIdx])
+      ? trackChains[trackIdx].input
+      : ((trackIdx >= 0 && trackGainNodes[trackIdx]) ? trackGainNodes[trackIdx] : masterGain);
 
     // External sampler — only for namespaced categories, so the internal
     // TR-606 / bass / pad engines are never shadowed.
@@ -1310,6 +1421,160 @@ const AudioEngine = (() => {
   function samplerCategoryName(name) { return SAMPLER_PREFIX + name; }
   function isSamplerType(type) { return typeof type === 'string' && type.startsWith(SAMPLER_PREFIX); }
 
+  // ─── Audio recording (WAV) ───────────────────────────────────
+  // An AudioWorklet taps the master bus and the samples are encoded to a
+  // 16-bit WAV on stop. A ScriptProcessor would have been simpler but it
+  // runs on the main thread and glitches under load.
+  let captureNode = null;
+  let captureSink = null;
+  let captureChunks = [];
+  let capturing = false;
+
+  const CAPTURE_WORKLET = `
+class CaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input.length > 0 && input[0]) {
+      // Copy every channel — the worklet input is reused between calls.
+      const frames = [];
+      for (let c = 0; c < input.length; c++) frames.push(new Float32Array(input[c]));
+      this.port.postMessage(frames);
+    }
+    return true;
+  }
+}
+registerProcessor('musicbox-capture', CaptureProcessor);
+`;
+
+  async function startRecording() {
+    if (capturing) return false;
+    if (!ctx) init();
+    if (!ctx) return false;
+    if (!ctx.audioWorklet) {
+      console.warn('[Audio] AudioWorklet is unavailable — recording disabled.');
+      return false;
+    }
+    try {
+      if (!captureNode) {
+        const blob = new Blob([CAPTURE_WORKLET], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        await ctx.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+        captureNode = new AudioWorkletNode(ctx, 'musicbox-capture', {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [2],
+        });
+        captureNode.channelCount = 2;
+        captureNode.channelCountMode = 'explicit';
+        captureNode.port.onmessage = (e) => {
+          if (!capturing) return;
+          captureChunks.push(e.data);
+        };
+        // A node is only processed if it reaches the destination, so the
+        // worklet needs a path. A zero-gain sink pulls it without
+        // contributing a single sample of audio.
+        captureSink = ctx.createGain();
+        captureSink.gain.value = 0;
+        captureNode.connect(captureSink);
+        captureSink.connect(ctx.destination);
+      }
+    } catch (e) {
+      console.error('[Audio] could not start the capture worklet:', e);
+      captureNode = null;
+      return false;
+    }
+
+    captureChunks = [];
+    capturing = true;
+    // Tap the master bus. The worklet has no output connection, so it
+    // costs nothing but a copy.
+    masterGain.connect(captureNode);
+    return true;
+  }
+
+  /** Stop recording and return a WAV Blob (or null). */
+  function stopRecording() {
+    if (!capturing) return null;
+    capturing = false;
+    try { masterGain.disconnect(captureNode); } catch (e) {}
+    const channels = _mergeCaptureChunks(captureChunks);
+    captureChunks = [];
+    if (!channels || !channels.length || !channels[0].length) return null;
+    const bytes = _encodeWav(channels, ctx.sampleRate);
+    return new Blob([bytes], { type: 'audio/wav' });
+  }
+
+  function isRecording() { return capturing; }
+
+  /** Merge the per-block channel arrays into one long array per channel. */
+  function _mergeCaptureChunks(chunks) {
+    if (!chunks.length) return null;
+    const numChannels = chunks[0].length;
+    const lengths = new Array(numChannels).fill(0);
+    for (const block of chunks) {
+      for (let c = 0; c < numChannels; c++) {
+        lengths[c] += (block[c] ? block[c].length : 0);
+      }
+    }
+    const total = lengths[0];
+    if (!total) return null;
+    const out = [];
+    for (let c = 0; c < numChannels; c++) {
+      const arr = new Float32Array(lengths[c]);
+      let offset = 0;
+      for (const block of chunks) {
+        const src = block[c];
+        if (!src) continue;
+        arr.set(src, offset);
+        offset += src.length;
+      }
+      out.push(arr);
+    }
+    return out;
+  }
+
+  /** Encode float channels as a 16-bit PCM WAV file. */
+  function _encodeWav(channels, sampleRate) {
+    const numChannels = channels.length;
+    const numFrames = channels[0].length;
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const dataSize = numFrames * blockAlign;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    const writeStr = (offset, str) => {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    };
+
+    writeStr(0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeStr(8, 'WAVE');
+    writeStr(12, 'fmt ');
+    view.setUint32(16, 16, true);              // PCM header size
+    view.setUint16(20, 1, true);               // format = PCM
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * blockAlign, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);              // bits per sample
+    writeStr(36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    let offset = 44;
+    for (let i = 0; i < numFrames; i++) {
+      for (let c = 0; c < numChannels; c++) {
+        let s = channels[c][i];
+        if (!isFinite(s)) s = 0;
+        s = Math.max(-1, Math.min(1, s));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        offset += 2;
+      }
+    }
+    return new Uint8Array(buffer);
+  }
+
   return {
     init,
     getContext,
@@ -1329,9 +1594,16 @@ const AudioEngine = (() => {
     getTrackParams,
     getAllTrackParams,
     resetTrackParams,
+    setTrackFx,
+    getTrackFx,
+    getAllTrackFx,
+    resetTrackFx,
     voiceDesign,
     getSpatialFX,
     getAnalyser,
+    startRecording,
+    stopRecording,
+    isRecording,
     samplerCategoryName,
     isSamplerType,
     setReverbMix,

@@ -994,6 +994,27 @@ const Generator = (() => {
     return buildPatch(params);
   }
 
+  /**
+   * Generate N candidate patches from one base seed.
+   *
+   * Each variation gets a deterministic derived seed, so the whole set is
+   * reproducible from the base seed alone — share the base seed and the
+   * user gets the same sixteen candidates on another machine.
+   */
+  function generateVariations(input = {}, count = 16) {
+    const params = normaliseParams(input);
+    const base = params.seed || randomSeedString();
+    const out = [];
+    for (let i = 0; i < count; i++) {
+      const variantSeed = `${base}#${i}`;
+      const patch = buildPatch({ ...params, seed: variantSeed });
+      patch.meta.variantIndex = i;
+      patch.meta.baseSeed = base;
+      out.push(patch);
+    }
+    return out;
+  }
+
   /** Generate a single track's steps for a given role. */
   function generateTrack(role, input = {}) {
     const params = normaliseParams(input);
@@ -1028,7 +1049,8 @@ const Generator = (() => {
     // melody
     generateMelodyDegrees, developMotif,
     // patch
-    generate, generateTrack, normaliseParams, buildPatch, applyHumanise, blankStep, blankSteps,
+    generate, generateVariations, generateTrack, normaliseParams, buildPatch,
+    applyHumanise, blankStep, blankSteps,
   };
 })();
 

@@ -231,6 +231,60 @@ function eq(name, a, b) {
   ok('chord notes are diatonic', inScale);
 }
 
+// ─── 16 Variations ─────────────────────────────────────────────
+{
+  const base = { genre: 'techno', seed: 'VAR-BASE', stepCount: 16 };
+  const set1 = Generator.generateVariations(base, 16);
+  eq('16 variations are produced', set1.length, 16);
+
+  // Every variation must be distinct.
+  const sigs = new Set(set1.map(p => JSON.stringify(p.tracks.map(t => t.steps))));
+  eq('every variation is different', sigs.size, 16);
+
+  // Every variation must be valid.
+  let bad = 0;
+  set1.forEach(p => {
+    if (!p.tracks || p.tracks.length !== 8) bad++;
+    p.tracks.forEach(t => t.steps.forEach(s => {
+      if (typeof s.active !== 'boolean') bad++;
+    }));
+  });
+  ok('every variation is well formed', bad === 0, `${bad} problems`);
+
+  // The set must be reproducible from the base seed.
+  const set2 = Generator.generateVariations(base, 16);
+  eq('the same base seed gives the same set',
+     JSON.stringify(set1.map(p => p.meta.seed)),
+     JSON.stringify(set2.map(p => p.meta.seed)));
+  eq('the same base seed gives the same patterns',
+     JSON.stringify(set1.map(p => p.tracks)),
+     JSON.stringify(set2.map(p => p.tracks)));
+
+  // A different base seed gives a different set.
+  const set3 = Generator.generateVariations({ ...base, seed: 'OTHER' }, 16);
+  ok('a different base seed gives a different set',
+     JSON.stringify(set1.map(p => p.tracks)) !== JSON.stringify(set3.map(p => p.tracks)));
+
+  // The seeds must be unique within a set.
+  const seeds = new Set(set1.map(p => p.meta.seed));
+  eq('every variation has a unique seed', seeds.size, 16);
+  ok('every variation records its index', set1.every((p, i) => p.meta.variantIndex === i));
+  ok('every variation records its base seed', set1.every(p => p.meta.baseSeed === 'VAR-BASE'));
+
+  // The variations must still be musically valid (in scale).
+  const scale = Generator.SCALES[Generator.GENRES.techno.scale];
+  let offScale = 0;
+  set1.forEach(p => {
+    p.tracks.forEach(t => {
+      if (!['bass', 'acid', 'lead', 'pad', 'chords'].includes(t.role)) return;
+      t.steps.forEach(s => {
+        if (s.active && Generator.scaleDegreeOf(p.meta.root, scale, s.note) < 0) offScale++;
+      });
+    });
+  });
+  ok('every variation stays in scale', offScale === 0, `${offScale} out of scale`);
+}
+
 // ─── Report ──────────────────────────────────────────────────────
 console.log('\n  MusicBox — generative engine tests\n');
 console.log(`  passed: ${passed}`);

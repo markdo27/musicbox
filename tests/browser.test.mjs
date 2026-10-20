@@ -74,6 +74,9 @@ const chrome = spawn(browser, [
   '--no-default-browser-check',
   '--disable-extensions',
   '--mute-audio',
+  // Without this the AudioContext stays 'suspended' (no user gesture),
+  // nothing renders, and the capture worklet never runs.
+  '--autoplay-policy=no-user-gesture-required',
   `--remote-debugging-port=${debugPort}`,
   `--user-data-dir=${profile}`,
   'about:blank',
@@ -217,8 +220,11 @@ ok('instrument panel rendered 8 rows', instrRows === 8, `got ${instrRows}`);
 const clockOpts = await q('#clock-source option');
 ok('clock source selector populated', clockOpts === 2, `got ${clockOpts}`);
 
-const synthRows = await q('.synth-row');
+const synthRows = await q('#synth-params .synth-row');
 ok('synth parameter panel rendered 8 rows', synthRows === 8, `got ${synthRows}`);
+
+const fxRows = await q('#fx-params .synth-row');
+ok('insert FX panel rendered 6 rows', fxRows === 6, `got ${fxRows}`);
 
 const learnBadges = await q('.learn-badge');
 ok('MIDI Learn badges were injected', learnBadges >= 12, `got ${learnBadges}`);
@@ -236,6 +242,32 @@ const synthState = await evaluate(`(() => {
 eq('the synth slider follows the engine', synthState.slider, '77');
 eq('the synth readout follows the engine', synthState.label, '77%');
 ok('the engine holds the value', Math.abs(synthState.param - 0.77) < 1e-6);
+
+// The per-track insert FX must be per track and clamped.
+const fxState = await evaluate(`(() => {
+  AudioEngine.setTrackFx(2, 'eqLow', -4.5);
+  AudioEngine.setTrackFx(2, 'sendReverb', 0.6);
+  AudioEngine.setTrackFx(2, 'eqHigh', 99);       // out of range
+  AudioEngine.setTrackFx(2, 'drive', -3);        // out of range
+  UI.setSynthTrackIdx(2);
+  UI.syncSynthPanel();
+  const other = AudioEngine.getTrackFx(3);
+  return {
+    low: AudioEngine.getTrackFx(2).eqLow,
+    rev: AudioEngine.getTrackFx(2).sendReverb,
+    high: AudioEngine.getTrackFx(2).eqHigh,
+    drive: AudioEngine.getTrackFx(2).drive,
+    otherLow: other.eqLow,
+    slider: document.getElementById('fx-eq-low').value,
+    label: document.getElementById('fx-eq-low-val').textContent,
+  };
+})()`);
+ok('the FX value is stored', Math.abs(fxState.low + 4.5) < 1e-6);
+ok('the FX value is clamped to ±12 dB', fxState.high === 12, `got ${fxState.high}`);
+ok('the FX drive is clamped to 0..1', fxState.drive === 0, `got ${fxState.drive}`);
+ok('FX is per track', fxState.otherLow === 0);
+eq('the FX slider follows the engine', fxState.slider, '-4');
+eq('the FX readout follows the engine', fxState.label, '-4.5dB');
 
 // MIDI Learn: learn a CC and check the control follows.
 const learnState = await evaluate(`(() => {
@@ -283,6 +315,155 @@ const clockSwitch = await evaluate(`(() => {
 eq('the sequencer follows the clock source', clockSwitch.ext.seq, 'external');
 eq('the MIDI layer follows the clock source', clockSwitch.ext.midi, 'external');
 eq('the clock source switches back', clockSwitch.back, 'internal');
+
+// ─── 16 Variations picker ───────────────────────────────────────
+const variations = await evaluate(`(() => {
+  document.getElementById('gen-variations').click();
+  const modal = document.getElementById('modal-variations');
+  const cells = document.querySelectorAll('#variations-grid .variation');
+  const canvases = document.querySelectorAll('#variations-grid .variation-canvas');
+  const open = !modal.hidden;
+
+  // Apply the third candidate and check the sequencer changed.
+  const before = JSON.stringify(Sequencer.getTracks().map(t => t.steps));
+  document.querySelectorAll('#variations-grid .variation')[2].click();
+  const after = JSON.stringify(Sequencer.getTracks().map(t => t.steps));
+  const closed = modal.hidden;
+  const seed = document.getElementById('gen-seed').value;
+
+  return { open, count: cells.length, canvases: canvases.length,
+           changed: before !== after, closed, seed };
+})()`);
+ok('the variations modal opens', variations.open === true);
+eq('16 variations are shown', variations.count, 16);
+eq('each variation has a canvas thumbnail', variations.canvases, 16);
+ok('applying a variation changes the pattern', variations.changed === true);
+ok('applying a variation closes the modal', variations.closed === true);
+ok('the applied variation records its seed', /#/.test(variations.seed), `seed "${variations.seed}"`);
+
+// ─── WAV recording ──────────────────────────────────────────────
+const rec = await evaluate(`(async () => {
+  AudioEngine.init();
+  const ctx = AudioEngine.getContext();
+  await ctx.resume();
+  const started = await AudioEngine.startRecording();
+  if (!started) return { started: false };
+  // Play a note so the capture has signal in it.
+  AudioEngine.triggerNote(0, 10, 60, 110, 0.2, false, false,
+                           AudioEngine.getContext().currentTime + 0.05);
+  await new Promise(r => setTimeout(r, 600));
+  const blob = AudioEngine.stopRecording();
+  if (!blob) return { started: true, blob: false };
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  const h = (i) => String.fromCharCode(buf[i]);
+  return {
+    started: true,
+    blob: true,
+    size: buf.length,
+    riff: h(0) + h(1) + h(2) + h(3),
+    wave: h(8) + h(9) + h(10) + h(11),
+    fmt: h(12) + h(13) + h(14) + h(15),
+    channels: buf[22] | (buf[23] << 8),
+    rate: buf[24] | (buf[25] << 8) | (buf[26] << 16) | (buf[27] << 24),
+    bits: buf[34] | (buf[35] << 8),
+    dataSize: buf[40] | (buf[41] << 8) | (buf[42] << 16) | (buf[43] << 24),
+    type: blob.type,
+  };
+})()`);
+ok('the capture worklet starts', rec.started === true);
+ok('a WAV blob was produced', rec.blob === true);
+eq('the file is a RIFF container', rec.riff, 'RIFF');
+eq('the container holds a WAVE', rec.wave, 'WAVE');
+eq('the chunk is a fmt chunk', rec.fmt, 'fmt ');
+eq('the WAV is 16-bit', rec.bits, 16);
+eq('the WAV is stereo', rec.channels, 2);
+ok('the sample rate is sensible', rec.rate >= 22050 && rec.rate <= 192000, `${rec.rate}`);
+ok('the data chunk is non-empty', rec.dataSize > 0, `${rec.dataSize}`);
+ok('the file size matches the header', rec.size === 44 + rec.dataSize,
+  `size ${rec.size}, header says ${rec.dataSize}`);
+eq('the blob type is audio/wav', rec.type, 'audio/wav');
+
+// The record button must reflect the state.
+const recBtn = await evaluate(`(() => {
+  const b = document.getElementById('btn-audio-rec');
+  return { exists: !!b, title: b ? b.title : '' };
+})()`);
+ok('the record button exists', recBtn.exists === true);
+ok('the record button is labelled', /WAV/i.test(recBtn.title));
+
+// ─── Pattern bank + song arranger ──────────────────────────────
+const bankUI = await evaluate(`(() => {
+  const pads = document.querySelectorAll('#pattern-slots .slot-pad');
+  const cells = document.querySelectorAll('#song-strip .song-cell');
+  return { pads: pads.length, cells: cells.length };
+})()`);
+eq('the pattern bank shows 8 slots', bankUI.pads, 8);
+eq('the song strip shows 16 bars', bankUI.cells, 16);
+
+const songUI = await evaluate(`(() => {
+  // Save the current pattern into slot A, make slot B different.
+  Sequencer.saveToSlot(0);
+  Sequencer.toggleStep(0, 0);
+  Sequencer.saveToSlot(1);
+  Sequencer.toggleStep(0, 0);
+
+  // Turn song mode on and put slot A on bar 0, slot B on bar 1.
+  const toggle = document.getElementById('song-enabled');
+  toggle.checked = true;
+  toggle.dispatchEvent(new Event('change', { bubbles: true }));
+  Sequencer.setArrangementBar(0, 0);
+  Sequencer.setArrangementBar(1, 1);
+  UI.renderSong();
+
+  const a = Sequencer.getActiveTracks(0)[0].steps[0].active;
+  const b = Sequencer.getActiveTracks(16)[0].steps[0].active;
+  const cellText = Array.from(document.querySelectorAll('#song-strip .song-cell'))
+    .map(c => c.textContent).join('');
+
+  // Resize the arrangement.
+  const bars = document.getElementById('song-bars');
+  bars.value = '32';
+  bars.dispatchEvent(new Event('change', { bubbles: true }));
+  const cells32 = document.querySelectorAll('#song-strip .song-cell').length;
+
+  // Back off.
+  toggle.checked = false;
+  toggle.dispatchEvent(new Event('change', { bubbles: true }));
+
+  return { a, b, cellText, cells32, enabled: Sequencer.getSong().enabled };
+})()`);
+ok('bar 0 and bar 1 play different slots', songUI.a !== songUI.b);
+ok('the strip shows the slot letters', /A/.test(songUI.cellText) && /B/.test(songUI.cellText));
+eq('the arrangement resizes to 32 bars', songUI.cells32, 32);
+ok('song mode can be turned off', songUI.enabled === false);
+
+// Clicking a slot in the bank switches the edit buffer.
+const slotClick = await evaluate(`(() => {
+  const before = JSON.stringify(Sequencer.getTracks().map(t => t.steps));
+  document.querySelectorAll('#pattern-slots .slot-pad')[1].click();
+  const after = JSON.stringify(Sequencer.getTracks().map(t => t.steps));
+  return { changed: before !== after, active: Sequencer.getBank().activeSlot };
+})()`);
+eq('clicking a slot selects it', slotClick.active, 1);
+ok('clicking a slot loads its pattern', slotClick.changed === true);
+
+// Arrow keys move the selection in the variations picker.
+const arrowNav = await evaluate(`(() => {
+  document.getElementById('gen-variations').click();
+  const sel = () => Array.from(document.querySelectorAll('#variations-grid .variation'))
+    .findIndex(e => e.classList.contains('selected'));
+  const start = sel();
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+  const moved = sel();
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+  const back = sel();
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+  return { start, moved, back, closed: document.getElementById('modal-variations').hidden };
+})()`);
+eq('the first variation starts selected', arrowNav.start, 0);
+eq('the right arrow moves the selection', arrowNav.moved, 1);
+eq('the left arrow moves it back', arrowNav.back, 0);
+ok('Escape closes the picker without stopping', arrowNav.closed === true);
 
 // The app must have booted.
 const booted = await evaluate('typeof window.Sequencer !== "undefined" && typeof window.Generator !== "undefined" && typeof window.UI !== "undefined"');

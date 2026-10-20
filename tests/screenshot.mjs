@@ -69,6 +69,17 @@ await new Promise(r => ws.addEventListener('open', r, { once: true }));
 await send('Page.enable');
 await send('Emulation.setDeviceMetricsOverride', { width: W, height: H, deviceScaleFactor: 1, mobile: false });
 await new Promise(r => setTimeout(r, 3000));
+
+// Optional: a JS expression to evaluate before the capture.
+const script = process.argv[5];
+if (script) {
+  const res = await send('Runtime.evaluate', { expression: script, awaitPromise: true, returnByValue: true });
+  if (res.exceptionDetails) {
+    console.error('script failed:', JSON.stringify(res.exceptionDetails).slice(0, 300));
+  }
+  await new Promise(r => setTimeout(r, 900));
+}
+
 const shot = await send('Page.captureScreenshot', { format: 'png' });
 fs.mkdirSync(path.dirname(OUT), { recursive: true });
 fs.writeFileSync(OUT, Buffer.from(shot.data, 'base64'));
