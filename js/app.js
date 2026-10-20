@@ -99,6 +99,86 @@
     if (idx >= 0) UI.flashTrackActivity(idx);
   });
 
+  // ─── MIDI Learn ───────────────────────────────────────────────
+  if (window.MidiLearn) {
+    MidiLearn.load();
+
+    // Which hardware device does a learnable control talk to?
+    MidiLearn.setOutputResolver((el) => {
+      let idx = null;
+      if (el.dataset.learnTrack !== undefined) {
+        idx = parseInt(el.dataset.learnTrack, 10);
+      } else if (el.closest && el.closest('#panel-synth')) {
+        idx = UI.getSynthTrackIdx();
+      }
+      if (idx === null || Number.isNaN(idx)) return null;   // default output
+      const t = Sequencer.getState().tracks[idx];
+      return t ? t.midiOutputId : null;
+    });
+
+    let learnBannerTimer = null;
+    MidiLearn.setStatusCallback((msg, kind) => {
+      const banner = $('midi-learn-banner');
+      const text = $('midi-learn-text');
+      if (!banner || !text) return;
+      text.textContent = msg;
+      banner.classList.toggle('learning', MidiLearn.isLearning());
+      banner.hidden = false;
+      if (learnBannerTimer) clearTimeout(learnBannerTimer);
+      if (!MidiLearn.isLearning()) {
+        learnBannerTimer = setTimeout(() => { banner.hidden = true; }, 2600);
+      }
+    });
+
+    $('midi-learn-cancel').addEventListener('click', () => {
+      MidiLearn.cancelLearn();
+      $('midi-learn-banner').hidden = true;
+    });
+  }
+
+  // MIDI CC activity LED
+  let ccLedTimer = null;
+  MidiManager.setCcActivityCallback(() => {
+    const led = $('midi-cc-led');
+    if (!led) return;
+    led.classList.add('active');
+    if (ccLedTimer) clearTimeout(ccLedTimer);
+    ccLedTimer = setTimeout(() => led.classList.remove('active'), 140);
+  });
+
+  // ─── External (slave) clock ───────────────────────────────────
+  MidiManager.setExternalClockCallback((clock) => {
+    if (clock.start) {
+      // The hardware started — rewind the slave grid and follow it.
+      Sequencer.resetExternalClock();
+      if (!Sequencer.isPlaying()) {
+        AudioEngine.init();
+        AudioEngine.resume();
+        Sequencer.play();
+      }
+      UI.showToast('Following external MIDI clock', 'info');
+    } else if (clock.stop) {
+      if (Sequencer.isPlaying()) Sequencer.stop();
+    }
+    if (clock.running && clock.bpm) {
+      const bpm = Math.round(clock.bpm);
+      if (Math.abs(bpm - Sequencer.getState().bpm) > 0.5) {
+        Sequencer.setBpm(bpm);
+      }
+    }
+  });
+
+  // Clock source switch
+  $('clock-source').addEventListener('change', (e) => {
+    const src = e.target.value;
+    Sequencer.setClockSource(src);
+    if (src === 'external') {
+      UI.showToast('Clock: EXTERNAL — MusicBox follows your hardware', 'info');
+    } else {
+      UI.showToast('Clock: INTERNAL — MusicBox drives the hardware', 'info');
+    }
+  });
+
   // ─── Load saved project or init defaults ──────────────────────
   const saved = Storage.load();
   if (saved) {
@@ -144,6 +224,33 @@
   }
   UI.renderInstruments();
   UI.renderGenerator();
+  UI.renderSynthPanel();
+  if (window.MidiLearn) MidiLearn.decorate(document);
+
+  // ─── Synth parameters ─────────────────────────────────────────
+  UI.SYNTH_PARAM_MAP.forEach(m => {
+    const el = $(m.id);
+    if (!el) return;
+    el.addEventListener('input', () => {
+      const raw = parseInt(el.value, 10);
+      const v = raw / m.scale;
+      const idx = UI.getSynthTrackIdx();
+      AudioEngine.setTrackParam(idx, m.key, v);
+      const lbl = $(m.id + '-val');
+      if (lbl) lbl.textContent = (m.key === 'tune' ? raw : Math.round(v * m.scale)) + m.suffix;
+      // Push the equivalent CC to the hardware, if the device supports it.
+      const t = Sequencer.getState().tracks[idx];
+      if (t && m.cc) {
+        MidiManager.pushParamToDevice(t.midiChannel || 1, m.cc, v, t.midiOutputId);
+      }
+    });
+  });
+
+  $('synth-reset').addEventListener('click', () => {
+    AudioEngine.resetTrackParams(UI.getSynthTrackIdx());
+    UI.syncSynthPanel();
+    UI.showToast('Synth params reset', 'info');
+  });
 
   // Audio toggle button
   const audioToggleBtn = $('btn-audio-toggle');

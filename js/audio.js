@@ -69,6 +69,59 @@ const AudioEngine = (() => {
   // Per-track gain nodes (real-time Web Audio volume control)
   const trackGainNodes = new Array(8).fill(null);
 
+  // ─── Per-track synth parameters ──────────────────────────────
+  // These are the "front panel" of each voice. They are exposed in the UI,
+  // are MIDI-learnable, and are pushed to hardware as CC where the device
+  // profile supports it.
+  //
+  //   cutoff    0..1    base filter frequency scale
+  //   resonance 0..1    filter Q
+  //   decay     0..1    filter envelope decay time
+  //   env       0..1    filter envelope depth (how far it opens)
+  //   drive     0..1    output saturation
+  //   glide     0..1    portamento time (acid)
+  //   tune      -12..12 semitone offset
+  //   level     0..1    output level
+  const DEFAULT_SYNTH_PARAMS = {
+    cutoff: 0.5, resonance: 0.45, decay: 0.35, env: 0.75,
+    drive: 0.2, glide: 0.3, tune: 0, level: 0.8,
+  };
+  const trackParams = Array.from({ length: 8 }, () => ({ ...DEFAULT_SYNTH_PARAMS }));
+
+  function setTrackParam(trackIdx, key, value) {
+    if (trackIdx < 0 || trackIdx >= trackParams.length) return;
+    if (!(key in DEFAULT_SYNTH_PARAMS)) return;
+    const def = DEFAULT_SYNTH_PARAMS[key];
+    let v = Number(value);
+    if (!isFinite(v)) v = def;
+    if (key === 'tune') v = Math.max(-12, Math.min(12, Math.round(v)));
+    else v = Math.max(0, Math.min(1, v));
+    trackParams[trackIdx][key] = v;
+  }
+
+  function getTrackParams(trackIdx) {
+    if (trackIdx < 0 || trackIdx >= trackParams.length) return { ...DEFAULT_SYNTH_PARAMS };
+    return { ...trackParams[trackIdx] };
+  }
+
+  function getAllTrackParams() { return trackParams.map(p => ({ ...p })); }
+
+  function resetTrackParams(trackIdx) {
+    if (trackIdx < 0 || trackIdx >= trackParams.length) return;
+    trackParams[trackIdx] = { ...DEFAULT_SYNTH_PARAMS };
+  }
+
+  /** Resolve the params for a track (or the defaults for ad-hoc voices). */
+  function _params(trackIdx) {
+    if (trackIdx >= 0 && trackIdx < trackParams.length) return trackParams[trackIdx];
+    return DEFAULT_SYNTH_PARAMS;
+  }
+
+  // Frequency for a MIDI note, including the track's tune offset.
+  function _midiToFreq(note, tune = 0) {
+    return 440 * Math.pow(2, (note - 69 + tune) / 12);
+  }
+
   // Sampler categories are namespaced so they can never shadow an
   // internal instrument type ('drum', 'bass', 'pad' are both).
   const SAMPLER_PREFIX = 'strudel:';
@@ -200,19 +253,19 @@ const AudioEngine = (() => {
     }
 
     if (instrType === 'drum') {
-      _playDrum(note, vel, outBus, t);
+      _playDrum(note, vel, outBus, t, _params(trackIdx));
       return null;
     }
     if (instrType === 'acid') {
       return _playAcidBass(channel, note, vel, outBus, accent, slide, trackIdx, t);
     }
     if (instrType === 'bass') {
-      return _playBass(channel, note, vel, outBus, t, slide);
+      return _playBass(channel, note, vel, outBus, t, slide, trackIdx);
     }
     if (instrType === 'pad') {
-      return _playPad(channel, note, vel, outBus, t, slide);
+      return _playPad(channel, note, vel, outBus, t, slide, trackIdx);
     }
-    return _playSynth(channel, note, vel, outBus, t, slide);
+    return _playSynth(channel, note, vel, outBus, t, slide, trackIdx);
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -311,33 +364,40 @@ const AudioEngine = (() => {
     70: 'clap', 75: 'clap',
   };
 
-  function _playDrum(note, vel, outBus, when) {
+  function _playDrum(note, vel, outBus, when, params = null) {
     const type = DRUM_MAP[note] || (note % 2 === 0 ? 'kick' : 'hihat_closed');
     const bus = outBus || masterGain;
+    // The 606's tuning pots: `tune` transposes the drum, `decay` scales
+    // its decay time.
+    const tune = params ? Math.round(params.tune) : 0;
+    const n = tune ? Math.max(0, Math.min(127, note + tune)) : note;
+    const decayScale = params ? (0.5 + params.decay * 1.4) : 1;
     switch (type) {
-      case 'kick':         _kick(vel, bus, when); break;
-      case 'snare':        _snare(vel, bus, when); break;
-      case 'hihat_closed': _hihat(vel, 0.06, bus, when); break;
-      case 'hihat_open':   _hihat(vel, 0.35, bus, when); break;
+      case 'kick':         _kick(vel, bus, when, decayScale, n); break;
+      case 'snare':        _snare(vel, bus, when, decayScale, n); break;
+      case 'hihat_closed': _hihat(vel, 0.06 * decayScale, bus, when); break;
+      case 'hihat_open':   _hihat(vel, 0.35 * decayScale, bus, when); break;
       case 'clap':         _clap(vel, bus, when); break;
       case 'rim':          _rim(vel, bus, when); break;
       case 'crash':        _crash(vel, bus, when); break;
       case 'ride':         _ride(vel, bus, when); break;
-      case 'tom':          _tom(vel, 80 + (note - 41) * 8, bus, when); break;
-      default:             _hihat(vel, 0.08, bus, when); break;
+      case 'tom':          _tom(vel, 80 + (n - 41) * 8, bus, when); break;
+      default:             _hihat(vel, 0.08 * decayScale, bus, when); break;
     }
   }
 
   // ─── TR-606 Kick Drum ──────────────────────────────────────
   // Pitch: 180Hz → 30Hz over 400ms (deep, punchy, 606-authentic)
-  function _kick(vel, bus, when) {
+  function _kick(vel, bus, when, decayScale = 1, note = 36) {
     const now = when;
+    // The 606's tuning pot transposes the whole drum.
+    const ratio = Math.pow(2, (note - 36) / 12);
 
     // Sub sine body
     const osc = ctx.createOscillator();
     osc.type = 'sine';
-    osc.frequency.setValueAtTime(180, now);
-    osc.frequency.exponentialRampToValueAtTime(30, now + 0.4);
+    osc.frequency.setValueAtTime(180 * ratio, now);
+    osc.frequency.exponentialRampToValueAtTime(30 * ratio, now + 0.4);
 
     // Soft clip waveshaper (subtle saturation)
     const shaper = ctx.createWaveShaper();
@@ -346,7 +406,7 @@ const AudioEngine = (() => {
 
     const env = ctx.createGain();
     env.gain.setValueAtTime(vel * 1.3, now);
-    env.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + 0.5 * decayScale);
 
     osc.connect(shaper);
     shaper.connect(env);
@@ -373,21 +433,22 @@ const AudioEngine = (() => {
   }
 
   // ─── TR-606 Snare ─────────────────────────────────────────
-  function _snare(vel, bus, when) {
+  function _snare(vel, bus, when, decayScale = 1, note = 38) {
     const now = when;
+    const ratio = Math.pow(2, (note - 38) / 12);
 
     // Tuned body: sine 220Hz → 110Hz (60% mix)
     const bodyOsc = ctx.createOscillator();
     bodyOsc.type = 'sine';
-    bodyOsc.frequency.setValueAtTime(220, now);
-    bodyOsc.frequency.exponentialRampToValueAtTime(110, now + 0.07);
+    bodyOsc.frequency.setValueAtTime(220 * ratio, now);
+    bodyOsc.frequency.exponentialRampToValueAtTime(110 * ratio, now + 0.07);
     const bodyEnv = ctx.createGain();
     bodyEnv.gain.setValueAtTime(vel * 0.45, now);
-    bodyEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.1);
+    bodyEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.1 * decayScale);
     bodyOsc.connect(bodyEnv);
     bodyEnv.connect(bus);
     bodyOsc.start(now);
-    bodyOsc.stop(now + 0.12);
+    bodyOsc.stop(now + 0.12 * decayScale);
 
     // Noise component: bandpass 2500Hz (40% mix), sharp transient
     const noiseBuf = _makeNoise(0.25);
@@ -395,11 +456,11 @@ const AudioEngine = (() => {
     noiseSrc.buffer = noiseBuf;
     const noiseFilter = ctx.createBiquadFilter();
     noiseFilter.type = 'bandpass';
-    noiseFilter.frequency.value = 2500;
+    noiseFilter.frequency.value = 2500 * ratio;
     noiseFilter.Q.value = 0.8;
     const noiseEnv = ctx.createGain();
     noiseEnv.gain.setValueAtTime(vel * 0.85, now);
-    noiseEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+    noiseEnv.gain.exponentialRampToValueAtTime(0.0001, now + 0.18 * decayScale);
     noiseSrc.connect(noiseFilter);
     noiseFilter.connect(noiseEnv);
     noiseEnv.connect(bus);
@@ -587,8 +648,41 @@ const AudioEngine = (() => {
   // MELODIC SYNTHESIS
   // ═══════════════════════════════════════════════════════════════
 
-  function _midiToFreq(note) {
-    return 440 * Math.pow(2, (note - 69) / 12);
+  /**
+   * Compute a voice's design values from its parameters.
+   *
+   * This is PURE — no AudioContext — so the synthesis model can be unit
+   * tested without rendering a single sample. The voice functions below
+   * call it, so the test verifies the real code path, not a copy.
+   *
+   * @param {object} p       the track's synth parameters
+   * @param {boolean} accent is this note accented?
+   * @param {string} kind    'acid' | 'bass' | 'lead' | 'pad'
+   */
+  function voiceDesign(p, accent = false, kind = 'acid') {
+    const cutoffSpan = kind === 'acid' ? 1400 : kind === 'pad' ? 2600 : 1800;
+    const baseFloor  = kind === 'acid' ? 180 : 200;
+    const baseCutoff = baseFloor + p.cutoff * cutoffSpan;
+
+    // The envelope DEPTH — how far the filter opens. On a 303 this is
+    // the ENV AMOUNT knob, and it is what makes an accent sound like an
+    // accent rather than just a louder note.
+    const envDepth = 1 + p.env * 8;
+    const peakCutoff = Math.min(12000, baseCutoff * envDepth * (accent ? 1.6 : 1));
+
+    const q = 0.7 + p.resonance * 16;
+    const decayTC = 0.04 + p.decay * 1.2;
+    const glideTC = 0.008 + p.glide * 0.12;
+
+    return {
+      baseCutoff,
+      peakCutoff,
+      q,
+      decayTC,
+      glideTC,
+      level: p.level,
+      envDepth,
+    };
   }
 
   // ───────────────────────────────────────────────────────
@@ -598,20 +692,35 @@ const AudioEngine = (() => {
   const ACID_GLIDE = 0.045;   // 45ms portamento — audible, 303-ish
   const ACID_DECAY = 0.22;    // filter envelope decay time constant
 
+  /** Asymmetric soft-clip curve for the 303's output stage. */
+  function _makeDriveCurve(amount) {
+    const samples = 1024;
+    const curve = new Float32Array(samples);
+    const norm = Math.tanh(amount);
+    for (let i = 0; i < samples; i++) {
+      const x = (i * 2) / samples - 1;
+      const bias = x >= 0 ? 1 : 0.7;   // the 303's asymmetry
+      curve[i] = (Math.tanh(x * amount) / norm) * bias;
+    }
+    return curve;
+  }
+
   function _playAcidBass(channel, note, vel, bus, accent, slide, trackIdx, when) {
     const now = when;
-    const freq = _midiToFreq(note);
+    const p = _params(trackIdx);
+    const freq = _midiToFreq(note, p.tune);
     const key = `acid-${channel}-${trackIdx}`;
     const existing = acidVoices.get(key);
 
     // ── SLIDE: the previous note was flagged to slide, so GLIDE into
     //    this pitch instead of retriggering the envelope.
     if (existing && existing.osc && existing.slideOut) {
+      const glideTC = 0.008 + p.glide * 0.12;
       existing.osc.frequency.cancelScheduledValues(now);
-      existing.osc.frequency.setTargetAtTime(freq, now, ACID_GLIDE);
+      existing.osc.frequency.setTargetAtTime(freq, now, glideTC);
       if (existing.sub) {
         existing.sub.frequency.cancelScheduledValues(now);
-        existing.sub.frequency.setTargetAtTime(freq / 2, now, ACID_GLIDE);
+        existing.sub.frequency.setTargetAtTime(freq / 2, now, glideTC);
       }
       existing.currentNote = note;
       existing.slideOut = false;
@@ -635,29 +744,32 @@ const AudioEngine = (() => {
     // 4-pole ladder approximation: two cascaded biquads = 24 dB/oct,
     // close to the 303's 18 dB/oct, and much steeper than a single
     // biquad (12 dB/oct) which is what this used to be.
-    const baseCutoff  = 320;
-    const peakCutoff  = accent ? 4200 : 1500;
+    const d = voiceDesign(p, accent, 'acid');
+    const baseCutoff = d.baseCutoff;
+    const peakCutoff = d.peakCutoff;
+    const q          = d.q;
+    const decayTC    = d.decayTC;
 
     const f1 = ctx.createBiquadFilter();
     f1.type = 'lowpass';
-    f1.Q.value = accent ? 14 : 6;
+    f1.Q.value = q;
     f1.frequency.setValueAtTime(baseCutoff, now);
     f1.frequency.linearRampToValueAtTime(peakCutoff, now + 0.002);
-    f1.frequency.setTargetAtTime(baseCutoff, now + 0.002, ACID_DECAY);
+    f1.frequency.setTargetAtTime(baseCutoff, now + 0.002, decayTC);
 
     const f2 = ctx.createBiquadFilter();
     f2.type = 'lowpass';
     f2.Q.value = 0.7;
     f2.frequency.setValueAtTime(baseCutoff, now);
     f2.frequency.linearRampToValueAtTime(peakCutoff, now + 0.002);
-    f2.frequency.setTargetAtTime(baseCutoff, now + 0.002, ACID_DECAY);
+    f2.frequency.setTargetAtTime(baseCutoff, now + 0.002, decayTC);
 
     // Amplitude envelope: fast attack, decay to a sustain level, so the
     // 303 articulates instead of droning at full volume.
     const env = ctx.createGain();
     const baseAmp = vel;
     const accentBoost = accent ? 1.45 : 1.0;   // +3dB on accent
-    const peakAmp = baseAmp * accentBoost * 0.75;
+    const peakAmp = baseAmp * accentBoost * 0.75 * d.level;
     const sustainAmp = peakAmp * 0.62;
     env.gain.setValueAtTime(0, now);
     env.gain.linearRampToValueAtTime(peakAmp, now + 0.002);
@@ -670,7 +782,20 @@ const AudioEngine = (() => {
     osc.connect(oscMix); oscMix.connect(f1);
     sub.connect(subMix); subMix.connect(f1);
     f1.connect(f2);
-    f2.connect(env);
+
+    // 303 output stage — a soft, asymmetric drive.
+    let tail = f2;
+    if (p.drive > 0.01) {
+      const shaper = ctx.createWaveShaper();
+      shaper.curve = _makeDriveCurve(1 + p.drive * 14);
+      shaper.oversample = '2x';
+      const post = ctx.createGain();
+      post.gain.value = 1 / (1 + p.drive * 1.4);
+      f2.connect(shaper);
+      shaper.connect(post);
+      tail = post;
+    }
+    tail.connect(env);
     env.connect(bus);
 
     osc.start(now);
@@ -729,10 +854,10 @@ const AudioEngine = (() => {
    * This is the same legato behaviour as the 303, applied to the other
    * synth voices.
    */
-  function _tryGlide(channel, note, when) {
+  function _tryGlide(channel, note, when, tune = 0) {
     const existing = melodicVoices.get(channel);
     if (!existing || !existing.slideOut || !existing.oscs || !existing.oscs.length) return null;
-    const freq = _midiToFreq(note);
+    const freq = _midiToFreq(note, tune);
     existing.oscs.forEach(o => {
       try {
         o.frequency.cancelScheduledValues(when);
@@ -749,12 +874,13 @@ const AudioEngine = (() => {
   }
 
   // ─── Bass Synth ─────────────────────────────────────────────
-  function _playBass(channel, note, vel, bus, when, slide = false) {
+  function _playBass(channel, note, vel, bus, when, slide = false, trackIdx = -1) {
     const now = when;
-    const freq = _midiToFreq(note);
+    const p = _params(trackIdx);
+    const freq = _midiToFreq(note, p.tune);
     const key = `${channel}-${note}`;
 
-    const glided = _tryGlide(channel, note, now);
+    const glided = _tryGlide(channel, note, now, p.tune);
     if (glided) return glided;
 
     const osc1 = ctx.createOscillator();
@@ -766,16 +892,20 @@ const AudioEngine = (() => {
     osc2.frequency.value = freq / 2; // sub octave
 
     // Low-pass filter with envelope
+    const d = voiceDesign(p, false, 'bass');
+    const baseCutoff = d.baseCutoff;
+    const peakCutoff = Math.min(12000, baseCutoff * (1 + p.env * 6));
     const filter = ctx.createBiquadFilter();
     filter.type = 'lowpass';
-    filter.frequency.setValueAtTime(300, now);
-    filter.frequency.linearRampToValueAtTime(2000 * vel + 400, now + 0.02);
-    filter.frequency.exponentialRampToValueAtTime(600, now + 0.3);
-    filter.Q.value = 6;
+    filter.frequency.setValueAtTime(baseCutoff, now);
+    filter.frequency.linearRampToValueAtTime(peakCutoff, now + 0.02);
+    filter.frequency.exponentialRampToValueAtTime(
+      Math.max(80, baseCutoff * 0.5), now + 0.05 + p.decay * 1.1);
+    filter.Q.value = 0.5 + p.resonance * 8;
 
     const env = ctx.createGain();
     env.gain.setValueAtTime(0, now);
-    env.gain.linearRampToValueAtTime(vel * 0.7, now + 0.008);
+    env.gain.linearRampToValueAtTime(vel * 0.7 * p.level, now + 0.008);
 
     osc1.connect(filter);
     osc2.connect(filter);
@@ -792,12 +922,13 @@ const AudioEngine = (() => {
   }
 
   // ─── Lead / Monosynth (ladder-style) ───────────────────────
-  function _playSynth(channel, note, vel, bus, when, slide = false) {
+  function _playSynth(channel, note, vel, bus, when, slide = false, trackIdx = -1) {
     const now = when;
-    const freq = _midiToFreq(note);
+    const p = _params(trackIdx);
+    const freq = _midiToFreq(note, p.tune);
     const key = `${channel}-${note}`;
 
-    const glided = _tryGlide(channel, note, now);
+    const glided = _tryGlide(channel, note, now, p.tune);
     if (glided) return glided;
 
     // Sawtooth primary + slight detune for width
@@ -811,23 +942,28 @@ const AudioEngine = (() => {
     osc2.detune.value = 7; // slight chorus detune
 
     // Ladder filter approximation: 2x cascade lowpass
+    const d = voiceDesign(p, false, 'lead');
+    const baseCutoff = d.baseCutoff;
+    const peakCutoff = Math.min(14000, baseCutoff * (1 + p.env * 5));
+    const settle = Math.max(120, baseCutoff * 0.45);
+
     const f1 = ctx.createBiquadFilter();
     f1.type = 'lowpass';
-    f1.frequency.setValueAtTime(400, now);
-    f1.frequency.linearRampToValueAtTime(2200, now + 0.05);
-    f1.frequency.exponentialRampToValueAtTime(1000, now + 0.4);
-    f1.Q.value = 3;
+    f1.frequency.setValueAtTime(baseCutoff, now);
+    f1.frequency.linearRampToValueAtTime(peakCutoff, now + 0.05);
+    f1.frequency.exponentialRampToValueAtTime(settle, now + 0.1 + p.decay * 1.4);
+    f1.Q.value = 0.4 + p.resonance * 7;
 
     const f2 = ctx.createBiquadFilter();
     f2.type = 'lowpass';
-    f2.frequency.setValueAtTime(400, now);
-    f2.frequency.linearRampToValueAtTime(2200, now + 0.05);
-    f2.frequency.exponentialRampToValueAtTime(1000, now + 0.4);
-    f2.Q.value = 2;
+    f2.frequency.setValueAtTime(baseCutoff, now);
+    f2.frequency.linearRampToValueAtTime(peakCutoff, now + 0.05);
+    f2.frequency.exponentialRampToValueAtTime(settle, now + 0.1 + p.decay * 1.4);
+    f2.Q.value = 0.3 + p.resonance * 2;
 
     const env = ctx.createGain();
     env.gain.setValueAtTime(0, now);
-    env.gain.linearRampToValueAtTime(vel * 0.45, now + 0.005); // 5ms attack
+    env.gain.linearRampToValueAtTime(vel * 0.45 * p.level, now + 0.005); // 5ms attack
 
     const mix = ctx.createGain(); mix.gain.value = 0.5;
 
@@ -844,12 +980,13 @@ const AudioEngine = (() => {
   }
 
   // ─── Pad Synth ──────────────────────────────────────────────
-  function _playPad(channel, note, vel, bus, when, slide = false) {
+  function _playPad(channel, note, vel, bus, when, slide = false, trackIdx = -1) {
     const now = when;
-    const freq = _midiToFreq(note);
+    const p = _params(trackIdx);
+    const freq = _midiToFreq(note, p.tune);
     const key = `${channel}-${note}`;
 
-    const glided = _tryGlide(channel, note, now);
+    const glided = _tryGlide(channel, note, now, p.tune);
     if (glided) return glided;
 
     const oscs = [];
@@ -863,15 +1000,16 @@ const AudioEngine = (() => {
       oscs.push(osc);
     });
 
+    const cutoff = voiceDesign(p, false, 'pad').baseCutoff;
     const filter = ctx.createBiquadFilter();
     filter.type = 'lowpass';
-    filter.frequency.setValueAtTime(200, now);
-    filter.frequency.linearRampToValueAtTime(2200, now + 0.8);
-    filter.Q.value = 1.5;
+    filter.frequency.setValueAtTime(cutoff, now);
+    filter.frequency.linearRampToValueAtTime(cutoff * (1 + p.env * 3), now + 0.8);
+    filter.Q.value = 0.3 + p.resonance * 3;
 
     const env = ctx.createGain();
     env.gain.setValueAtTime(0, now);
-    env.gain.linearRampToValueAtTime(vel * 0.25, now + 0.5); // slow attack
+    env.gain.linearRampToValueAtTime(vel * 0.25 * p.level, now + 0.5); // slow attack
 
     oscs.forEach(osc => {
       osc.connect(filter);
@@ -1187,6 +1325,11 @@ const AudioEngine = (() => {
     setTrackInstrument,
     getTrackInstruments,
     setTrackVolume,
+    setTrackParam,
+    getTrackParams,
+    getAllTrackParams,
+    resetTrackParams,
+    voiceDesign,
     getSpatialFX,
     getAnalyser,
     samplerCategoryName,

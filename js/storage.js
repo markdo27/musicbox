@@ -51,6 +51,7 @@ const Storage = (() => {
         steps: t.steps.map(s => ({ ...s })),
       })),
       instruments: window.AudioEngine ? AudioEngine.getTrackInstruments().map(i => i.type) : [],
+      synthParams: window.AudioEngine ? AudioEngine.getAllTrackParams() : null,
       spatialFX: window.AudioEngine ? AudioEngine.getSpatialFX() : null,
       masterVolume: window.AudioEngine ? AudioEngine.getMasterVolume() : 0.72,
       audioEnabled: window.AudioEngine ? AudioEngine.isEnabled() : true,
@@ -91,6 +92,7 @@ const Storage = (() => {
         })),
       }));
       p.generative = p.generative || null;
+      p.synthParams = p.synthParams || null;
       p.spatialFX = p.spatialFX || null;
       p.version = 2;
     }
@@ -139,6 +141,15 @@ const Storage = (() => {
       Sequencer.setStepCount(p.stepCount === 32 ? 32 : 16);
       Sequencer.initTracks(p.tracks || []);
       if (p.generative) Sequencer.setGenerativeParams(p.generative);
+      if (p.synthParams && window.AudioEngine) {
+        p.synthParams.forEach((params, idx) => {
+          if (!params) return;
+          Object.entries(params).forEach(([key, value]) => {
+            AudioEngine.setTrackParam(idx, key, value);
+          });
+        });
+        if (window.UI && UI.syncSynthPanel) UI.syncSynthPanel();
+      }
       if (p.instruments && window.AudioEngine) {
         p.instruments.forEach((type, idx) => {
           if (idx < (p.tracks || []).length) AudioEngine.setTrackInstrument(idx, type);

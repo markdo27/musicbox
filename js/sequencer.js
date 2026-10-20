@@ -48,6 +48,10 @@ const Sequencer = (() => {
   // MIDI notes still held per channel (for legato / slide)
   const heldMidiNotes = new Map(); // channel → note
 
+  // Clock source: 'internal' (we are the master) or 'external' (slave)
+  let clockSource = 'internal';
+  let extStepIndex = 0;   // steps scheduled in the current external run
+
   // ─── Undo / Redo history ────────────────────────────────────
   const undoStack = [];
   const redoStack = [];
@@ -124,9 +128,17 @@ const Sequencer = (() => {
   }
 
   // ─── Timing ──────────────────────────────────────────────────
+  function _externalBpm() {
+    if (clockSource !== 'external') return null;
+    const ec = MidiManager.getExternalClock();
+    return ec.running && ec.bpm ? ec.bpm : null;
+  }
+
   function _secondsPerStep() {
-    // One step = 1/16th note
-    const secondsPerBeat = 60.0 / state.bpm;
+    // One step = 1/16th note. In external (slave) mode the tempo comes
+    // from the hardware, not from the BPM field.
+    const bpm = _externalBpm() || state.bpm;
+    const secondsPerBeat = 60.0 / bpm;
     return secondsPerBeat / 4;
   }
 
@@ -147,9 +159,17 @@ const Sequencer = (() => {
   }
 
   // ─── Scheduler ───────────────────────────────────────────────
+  // 24 PPQN → 6 clock pulses per 16th-note step
+  const PULSES_PER_STEP = 6;
+
   function _scheduler() {
     const ctx = _ctx();
     if (!ctx) return;
+
+    // In external (slave) mode the hardware owns the timeline: steps are
+    // scheduled from the incoming clock's pulse grid, not from our timer.
+    if (clockSource === 'external') { _schedulerExternal(ctx); return; }
+
     const lookAheadTime = ctx.currentTime + lookAhead;
 
     // Guard: if a long stall (background tab, GC) left us behind, resync
@@ -161,6 +181,29 @@ const Sequencer = (() => {
     while (nextNoteTime < lookAheadTime) {
       _scheduleStep(state.currentStep + 1, nextNoteTime, absStep + 1);
       _advanceStep();
+    }
+  }
+
+  /**
+   * Slave-mode scheduler. The external clock's pulse grid is the master:
+   *   t(k) = lastPulseTime - (pulses - k) * pulseDuration
+   * so step j (which starts at pulse j*6) is scheduled on the hardware's
+   * own timeline, not ours.
+   */
+  function _schedulerExternal(ctx) {
+    const ec = MidiManager.getExternalClock();
+    if (!ec.running) return;
+
+    const stepPulses = Math.floor(ec.pulses / PULSES_PER_STEP);
+    if (extStepIndex >= stepPulses) return;
+
+    const pulseDur = ec.pulseDuration || (60 / (ec.bpm || 120) / 24);
+    while (extStepIndex < stepPulses) {
+      const j = extStepIndex;
+      const t = ec.lastPulseTime - (ec.pulses - j * PULSES_PER_STEP) * pulseDur;
+      const step = j % state.stepCount;
+      _scheduleStep(step, Math.max(t, ctx.currentTime + 0.002), j);
+      extStepIndex++;
     }
   }
 
@@ -280,6 +323,7 @@ const Sequencer = (() => {
     state.currentStep = -1;
     state.playingStep = -1;
     absStep = 0;
+    extStepIndex = 0;
     playStartTime = ctx.currentTime + 0.06;
     nextNoteTime = playStartTime;
     schedulerTimer = setInterval(_scheduler, scheduleInterval);
@@ -608,6 +652,27 @@ const Sequencer = (() => {
     _notify(true);
   }
 
+  // ─── Clock source (master / slave) ──────────────────────────
+  /**
+   * 'internal' — MusicBox generates the clock and drives the hardware.
+   * 'external' — the hardware generates the clock and MusicBox follows it.
+   */
+  function setClockSource(src) {
+    clockSource = (src === 'external') ? 'external' : 'internal';
+    extStepIndex = 0;
+    if (window.MidiManager) MidiManager.setClockSource(clockSource);
+    _notify(false);
+  }
+
+  function getClockSource() { return clockSource; }
+
+  /** Called when the hardware sends Start — rewind the slave grid. */
+  function resetExternalClock() {
+    extStepIndex = 0;
+    state.currentStep = -1;
+    state.playingStep = -1;
+  }
+
   // ─── Getters ──────────────────────────────────────────
   function getState() { return state; }
   function getTracks() { return state.tracks; }
@@ -659,6 +724,7 @@ const Sequencer = (() => {
     clearTrack, clearAllTracks,
     randomizeTrack, randomizeAll, applyPatch,
     setGenerativeParams, getGenerativeParams,
+    setClockSource, getClockSource, resetExternalClock,
     applyPreset,
     toggleMute, toggleSolo,
     setTrackAudioMode, setTrackMidiOutput,

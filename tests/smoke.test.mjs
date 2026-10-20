@@ -230,7 +230,7 @@ const sandbox = {
   Blob: class { constructor(parts) { this.parts = parts; } },
   URL: { createObjectURL: () => 'blob:x', revokeObjectURL() {} },
   Math, JSON, Date, Object, Array, String, Number, Boolean, Error, Set, Map, Float32Array, Uint8Array,
-  isFinite, isNaN, parseInt, parseFloat, Symbol, Promise, Proxy, RegExp,
+  isFinite, isNaN, parseInt, parseFloat, Symbol, Promise, Proxy, RegExp, Event,
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;
@@ -239,7 +239,7 @@ const ctx = vm.createContext(sandbox);
 
 // Load the modules in the same order as index.html
 const modules = ['generate.js', 'presets.js', 'sampler.js', 'audio.js', 'midi.js',
-                 'sequencer.js', 'storage.js', 'ui.js'];
+                 'midilearn.js', 'sequencer.js', 'storage.js', 'ui.js'];
 for (const m of modules) {
   const src = fs.readFileSync(path.join(ROOT, 'js', m), 'utf8');
   try {
@@ -337,6 +337,8 @@ Sequencer.toggleSolo(5);
 AudioEngine.setReverbMix(0.44);
 AudioEngine.setDelayTime(0.24);
 AudioEngine.setMasterVolume(0.55);
+AudioEngine.setTrackParam(3, 'cutoff', 0.33);
+AudioEngine.setTrackParam(3, 'tune', -4);
 
 ok('save() succeeds', Storage.save() === true);
 const raw = JSON.parse(localStorage.getItem('musicbox_project'));
@@ -345,6 +347,7 @@ ok('audioMode saved', raw.tracks[0].audioMode === 'internal');
 ok('midiOutputId saved', raw.tracks[4].midiOutputId === 'out-2');
 ok('soloed saved', raw.tracks[5].soloed === true);
 ok('generative saved', raw.generative && raw.generative.seed === 'SAVE-1');
+ok('synth params saved', raw.synthParams && Math.abs(raw.synthParams[3].cutoff - 0.33) < 1e-6);
 ok('spatial FX saved', raw.spatialFX && Math.abs(raw.spatialFX.reverbMix - 0.44) < 1e-6);
 ok('master volume saved', Math.abs(raw.masterVolume - 0.55) < 1e-6);
 
@@ -352,6 +355,7 @@ ok('master volume saved', Math.abs(raw.masterVolume - 0.55) < 1e-6);
 Sequencer.setTrackAudioMode(0, 'both');
 Sequencer.toggleSolo(5);
 Sequencer.randomizeAll();
+AudioEngine.setTrackParam(3, 'cutoff', 0.9);
 
 const loaded = Storage.load();
 ok('load() returns a project', !!loaded);
@@ -360,6 +364,8 @@ eq('audioMode restored', Sequencer.getState().tracks[0].audioMode, 'internal');
 eq('midiOutputId restored', Sequencer.getState().tracks[4].midiOutputId, 'out-2');
 eq('soloed restored', Sequencer.getState().tracks[5].soloed, true);
 eq('generative seed restored', Sequencer.getGenerativeParams().seed, 'SAVE-1');
+ok('synth params restored', Math.abs(AudioEngine.getTrackParams(3).cutoff - 0.33) < 1e-6);
+eq('synth tune restored', AudioEngine.getTrackParams(3).tune, -4);
 ok('reverb mix restored', Math.abs(AudioEngine.getSpatialFX().reverbMix - 0.44) < 1e-6);
 ok('master volume restored', Math.abs(AudioEngine.getMasterVolume() - 0.55) < 1e-6);
 
@@ -437,6 +443,188 @@ eq('internal drum type is not a sampler type', AudioEngine.isSamplerType('drum')
 eq('internal bass type is not a sampler type', AudioEngine.isSamplerType('bass'), false);
 eq('internal pad type is not a sampler type', AudioEngine.isSamplerType('pad'), false);
 eq('namespaced sampler type detected', AudioEngine.isSamplerType('strudel:drum'), true);
+
+// ═══════════════════════════════════════════════════════════════
+// MIDI LEARN
+// ═══════════════════════════════════════════════════════════════
+{
+  const { MidiLearn } = sandbox;
+
+  // A learnable control.
+  const slider = document.createElement('input');
+  slider.id = 'test-slider';
+  slider.min = '0'; slider.max = '100'; slider.step = '1'; slider.value = '0';
+  document._byId['test-slider'] = slider;
+
+  // A spy on the CC sender.
+  const sentCC = [];
+  const realSendCC = sandbox.MidiManager.sendCC;
+  sandbox.MidiManager.sendCC = (ch, cc, value, out) => { sentCC.push({ ch, cc, value, out }); };
+
+  ok('no mappings to start with', MidiLearn.count() === 0);
+
+  // Learning mode binds the next CC that arrives.
+  MidiLearn.beginLearn(slider);
+  ok('learn mode is armed', MidiLearn.isLearning() === true);
+  const consumed = MidiLearn.handleCC(3, 74, 64);
+  ok('the learning CC is consumed', consumed === true);
+  ok('learn mode ended', MidiLearn.isLearning() === false);
+  ok('a mapping exists', MidiLearn.count() === 1);
+
+  const map = MidiLearn.getMap();
+  const binding = map['test-slider'];
+  ok('the CC number was captured', binding.cc === 74);
+  ok('the channel was captured', binding.ch === 3);
+  eq('the control value followed the CC', slider.value, '50');
+
+  // A mapped CC drives the control.
+  slider.value = '0';
+  MidiLearn.handleCC(3, 74, 127);
+  eq('a mapped CC updates the control', slider.value, '100');
+  MidiLearn.handleCC(3, 74, 0);
+  eq('a mapped CC updates the control (low)', slider.value, '0');
+
+  // A different CC does not touch it.
+  MidiLearn.handleCC(3, 71, 127);
+  eq('an unmapped CC is ignored', slider.value, '0');
+
+  // A different channel does not touch it.
+  MidiLearn.handleCC(9, 74, 127);
+  eq('the wrong channel is ignored', slider.value, '0');
+
+  // Bidirectional: moving the control pushes the CC to the device.
+  slider.value = '50';
+  sentCC.length = 0;
+  MidiLearn.sendFor(slider);
+  eq('the control pushed one CC', sentCC.length, 1);
+  eq('the pushed CC number is right', sentCC[0].cc, 74);
+  eq('the pushed CC value is right', sentCC[0].value, 64);
+  eq('the pushed CC channel is right', sentCC[0].ch, 3);
+
+  // The round trip is stable.
+  eq('value → CC → value is stable', MidiLearn.valueToCC(slider), 64);
+
+  // Unbind.
+  MidiLearn.unbind(slider);
+  ok('the mapping was removed', MidiLearn.count() === 0);
+  sentCC.length = 0;
+  MidiLearn.sendFor(slider);
+  eq('an unmapped control pushes nothing', sentCC.length, 0);
+
+  sandbox.MidiManager.sendCC = realSendCC;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SYNTH PARAMETERS
+// ═══════════════════════════════════════════════════════════════
+{
+  AudioEngine.setTrackParam(4, 'cutoff', 0.8);
+  eq('a param was set', AudioEngine.getTrackParams(4).cutoff, 0.8);
+  AudioEngine.setTrackParam(4, 'cutoff', 5);
+  eq('an out-of-range param is clamped', AudioEngine.getTrackParams(4).cutoff, 1);
+  AudioEngine.setTrackParam(4, 'tune', 3.6);
+  eq('tune is an integer', AudioEngine.getTrackParams(4).tune, 4);
+  AudioEngine.setTrackParam(4, 'tune', 99);
+  eq('tune is clamped to +/- 12', AudioEngine.getTrackParams(4).tune, 12);
+  AudioEngine.setTrackParam(4, 'nonsense', 0.5);
+  ok('an unknown param is ignored', !('nonsense' in AudioEngine.getTrackParams(4)));
+
+  AudioEngine.resetTrackParams(4);
+  eq('reset restores the default cutoff', AudioEngine.getTrackParams(4).cutoff, 0.5);
+
+  // Per-track isolation.
+  AudioEngine.setTrackParam(0, 'level', 0.2);
+  eq('params are per track', AudioEngine.getTrackParams(1).level, 0.8);
+  AudioEngine.resetTrackParams(0);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CLOCK SOURCE (master / slave)
+// ═══════════════════════════════════════════════════════════════
+{
+  await MidiManager.requestAccess();
+  AudioEngine.init();
+
+  eq('the clock starts as internal', MidiManager.getClockSource(), 'internal');
+  eq('the sequencer starts as internal', Sequencer.getClockSource(), 'internal');
+
+  // In internal mode we send the clock.
+  sentMessages.length = 0;
+  MidiManager.startClock(120);
+  ok('internal mode sends Start', sentMessages.some(m => m[0] === 0xFA));
+  MidiManager.stopClock();
+
+  // In external mode we must not.
+  sentMessages.length = 0;
+  MidiManager.setClockSource('external');
+  eq('the clock source switched', MidiManager.getClockSource(), 'external');
+  MidiManager.startClock(120);
+  ok('external mode sends no Start', !sentMessages.some(m => m[0] === 0xFA));
+  ok('external mode sends no clock', !sentMessages.some(m => m[0] === 0xF8));
+
+  // The sequencer follows.
+  Sequencer.setClockSource('external');
+  eq('the sequencer is slaved', Sequencer.getClockSource(), 'external');
+  Sequencer.setClockSource('internal');
+  eq('the sequencer is a master again', Sequencer.getClockSource(), 'internal');
+  MidiManager.setClockSource('internal');
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SYNTHESIS MODEL — the voice design must be monotonic and correct
+// ═══════════════════════════════════════════════════════════════
+{
+  const P = (o) => Object.assign(
+    { cutoff: 0.5, resonance: 0.45, decay: 0.35, env: 0.75, drive: 0.2, glide: 0.3, tune: 0, level: 0.8 },
+    o);
+
+  const d = AudioEngine.voiceDesign(P({}), false, 'acid');
+  const dAccent = AudioEngine.voiceDesign(P({}), true, 'acid');
+
+  // Accent must open the filter FURTHER, not just be louder — that is
+  // the 303's defining behaviour.
+  ok('accent opens the filter further', dAccent.peakCutoff > d.peakCutoff,
+    `${d.peakCutoff} → ${dAccent.peakCutoff}`);
+  ok('accent does not change the base cutoff', dAccent.baseCutoff === d.baseCutoff);
+  ok('accent does not change the resonance', dAccent.q === d.q);
+
+  // Cutoff must be monotonic.
+  const lo = AudioEngine.voiceDesign(P({ cutoff: 0 }), false, 'acid');
+  const hi = AudioEngine.voiceDesign(P({ cutoff: 1 }), false, 'acid');
+  ok('cutoff is monotonic', hi.baseCutoff > lo.baseCutoff);
+  eq('cutoff 0 gives the floor', lo.baseCutoff, 180);
+  eq('cutoff 1 gives the ceiling', hi.baseCutoff, 1580);
+
+  // Resonance must be monotonic and bounded.
+  const rLo = AudioEngine.voiceDesign(P({ resonance: 0 }), false, 'acid');
+  const rHi = AudioEngine.voiceDesign(P({ resonance: 1 }), false, 'acid');
+  ok('resonance is monotonic', rHi.q > rLo.q);
+  ok('resonance stays in a sane range', rHi.q <= 17 && rLo.q >= 0.7);
+
+  // Envelope depth must be monotonic.
+  const eLo = AudioEngine.voiceDesign(P({ env: 0 }), false, 'acid');
+  const eHi = AudioEngine.voiceDesign(P({ env: 1 }), false, 'acid');
+  ok('envelope depth is monotonic', eHi.peakCutoff > eLo.peakCutoff);
+
+  // Decay must be monotonic in TIME (the old reverb mapping was inverted).
+  const dLo = AudioEngine.voiceDesign(P({ decay: 0 }), false, 'acid');
+  const dHi = AudioEngine.voiceDesign(P({ decay: 1 }), false, 'acid');
+  ok('decay time is monotonic', dHi.decayTC > dLo.decayTC);
+
+  // Glide must be monotonic.
+  const gLo = AudioEngine.voiceDesign(P({ glide: 0 }), false, 'acid');
+  const gHi = AudioEngine.voiceDesign(P({ glide: 1 }), false, 'acid');
+  ok('portamento time is monotonic', gHi.glideTC > gLo.glideTC);
+
+  // The peak must never exceed Nyquist-ish limits.
+  const extreme = AudioEngine.voiceDesign(P({ cutoff: 1, env: 1 }), true, 'acid');
+  ok('the filter peak is bounded', extreme.peakCutoff <= 12000, `${extreme.peakCutoff}`);
+
+  // The pad and lead voices use their own cutoff spans.
+  const pad = AudioEngine.voiceDesign(P({ cutoff: 1 }), false, 'pad');
+  const lead = AudioEngine.voiceDesign(P({ cutoff: 1 }), false, 'lead');
+  ok('the pad has a wider cutoff span', pad.baseCutoff > lead.baseCutoff);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // Report

@@ -97,12 +97,17 @@ body {
   height: var(--header-h);
   display: flex;
   align-items: center;
-  gap: 24px;
-  padding: 0 20px;
+  gap: 14px;
+  padding: 0 14px;
   background: var(--bg-deep);
   border-bottom: 1px solid var(--border-subtle);
   z-index: 100;
+  /* The header is dense — let it scroll rather than clip controls. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
 }
+.app-header::-webkit-scrollbar { display: none; }
 
 /* Logo */
 .logo {
@@ -347,8 +352,8 @@ body {
 }
 
 .icon-btn {
-  height: 34px;
-  padding: 0 12px;
+  height: 32px;
+  padding: 0 9px;
   background: var(--bg-elevated);
   border: 1px solid var(--border-muted);
   border-radius: 0;
@@ -357,6 +362,7 @@ body {
   cursor: pointer;
   transition: all 0.15s;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 .icon-btn:hover {
   border-color: var(--border-active);
@@ -1996,8 +2002,12 @@ kbd {
 .generator-panel {
   flex: 1 1 auto;
   min-height: 230px;
+  min-width: 0;
   gap: 10px;
   padding: 12px 14px;
+  /* The panel scrolls rather than letting its children overlap. */
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .gen-panel-head {
@@ -2006,6 +2016,7 @@ kbd {
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+  flex-shrink: 0;
 }
 
 .gen-seed-wrap {
@@ -2035,7 +2046,9 @@ kbd {
   grid-template-columns: minmax(320px, 1fr) minmax(240px, 380px);
   gap: 16px;
   align-items: stretch;
-  flex: 1 1 auto;
+  /* Do NOT shrink below the content height — the panel scrolls instead.
+     Shrinking here made the action bar overlap the controls. */
+  flex: 1 0 auto;
   min-height: 0;
 }
 
@@ -2125,7 +2138,7 @@ kbd {
   flex-direction: column;
   gap: 8px;
   height: 100%;
-  min-height: 0;
+  min-height: 190px;
 }
 
 .gen-preview-label {
@@ -2349,7 +2362,17 @@ button.device-card:not(:disabled):hover {
    than ~1100px the two sidebars squeezed the step grid into
    unusability, and on a phone it was unusable outright. */
 @media (max-width: 1400px) {
+  .gen-body {
+    grid-template-columns: minmax(280px, 1fr) minmax(210px, 320px);
+  }
+  .gen-controls {
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
   .gen-body { grid-template-columns: 1fr; }
+  .gen-preview { min-height: 200px; }
 }
 
 @media (max-width: 1200px) {
@@ -2392,4 +2415,195 @@ button.device-card:not(:disabled):hover {
   .gen-row > label { width: 58px; }
   .app-header { flex-wrap: wrap; height: var(--header-h); }
   .transport { flex-wrap: wrap; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   MIDI CONTROLLER LAYER
+   Clock source, MIDI Learn badges, CC activity LED, synth panel.
+   ═══════════════════════════════════════════════════════════════ */
+
+.clock-source-block {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 8px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.clock-source-block label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.clock-source-block select {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 3px 4px;
+  border: 1px solid var(--border-muted);
+  background: var(--bg-base);
+  color: var(--text-primary);
+}
+
+.clock-source-block select[data-external="true"] {
+  border-color: var(--accent-amber);
+  color: var(--accent-amber);
+  font-weight: 600;
+}
+
+/* ─── MIDI Learn banner ─────────────────────────────────────── */
+.midi-learn-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-muted);
+  padding: 4px 6px;
+  white-space: nowrap;
+}
+
+/* An author `display` rule beats the UA's [hidden] rule — restore it. */
+.midi-learn-banner[hidden] { display: none; }
+
+.midi-learn-banner.learning {
+  border-color: var(--accent-amber);
+  background: rgba(161,98,7,0.08);
+}
+
+.midi-learn-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.midi-learn-banner.learning .midi-learn-dot {
+  background: var(--accent-amber);
+  animation: learn-pulse 0.9s ease-in-out infinite;
+}
+
+@keyframes learn-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+/* ─── CC activity LED ───────────────────────────────────────── */
+.midi-cc-led {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--border-muted);
+  opacity: 0.5;
+  flex-shrink: 0;
+  transition: background 0.05s, opacity 0.05s;
+}
+
+.midi-cc-led.active {
+  background: var(--accent-amber);
+  opacity: 1;
+}
+
+/* ─── MIDI Learn badge ──────────────────────────────────────── */
+.learn-badge {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  line-height: 1;
+  width: 18px;
+  height: 15px;
+  padding: 0;
+  flex-shrink: 0;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 0;
+  /* Quiet by default — it should not compete with the control it maps. */
+  opacity: 0.32;
+  transition: color 0.15s, border-color 0.15s, background 0.15s, opacity 0.15s;
+}
+
+.learn-badge:hover,
+.learn-badge:focus-visible {
+  opacity: 1;
+  border-color: var(--text-primary);
+  color: var(--text-primary);
+}
+
+/* A control that has a mapping always shows it. */
+.learn-badge.mapped {
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  background: rgba(14,116,144,0.08);
+  width: auto;
+  min-width: 18px;
+  padding: 0 3px;
+  opacity: 1;
+}
+
+.learn-badge.learning {
+  color: #ffffff;
+  background: var(--accent-amber);
+  border-color: var(--accent-amber);
+  opacity: 1;
+  animation: learn-pulse 0.9s ease-in-out infinite;
+}
+
+/* ─── SYNTH parameter panel ─────────────────────────────────── */
+.synth-params {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.synth-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.synth-row > label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  width: 46px;
+  flex-shrink: 0;
+}
+
+.synth-row input[type="range"] {
+  flex: 1 1 0;
+  min-width: 0;
+  accent-color: var(--accent-cyan);
+}
+
+.synth-val {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-secondary);
+  width: 38px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.synth-track-select {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 2px 4px;
+  margin-left: auto;
+  border: 1px solid var(--border-muted);
+  background: var(--bg-base);
+  color: var(--text-primary);
+  max-width: 100px;
 }

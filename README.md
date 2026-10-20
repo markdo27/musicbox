@@ -9,7 +9,8 @@
 [![Live Demo](https://img.shields.io/badge/Open_in-Chrome-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white)](#getting-started)
 [![Web MIDI](https://img.shields.io/badge/Web_MIDI-API-00d4ff?style=for-the-badge)](#midi-hardware)
 [![Web Audio](https://img.shields.io/badge/Web_Audio-API-00ff88?style=for-the-badge)](#audio-engine)
-[![Tests](https://img.shields.io/badge/tests-150_passing-16a34a?style=for-the-badge&logo=node.js&logoColor=white)](tests/)
+[![Tests](https://img.shields.io/badge/tests-222_passing-16a34a?style=for-the-badge&logo=node.js&logoColor=white)](tests/)
+[![Benchmark](https://img.shields.io/badge/benchmark-8.0%2F10-16a34a?style=for-the-badge)](docs/AUDIT.md)
 
 </div>
 
@@ -30,11 +31,12 @@ build step, no dependencies, no accounts.
    and someone else gets the identical pattern.
 2. **It drives real hardware properly.** Per-track output routing to
    different MIDI devices, per-track Internal/MIDI/Both switching, a
-   **drift-free clock**, device CC profiles (TD-3, Crave, Edge, Model D,
-   Neutron), and true legato slides.
+   **drift-free clock** you can run as master *or* slave, **MIDI Learn**
+   (bind any control to a knob, bidirectionally), and device CC profiles
+   for the TD-3, Crave, Edge, Model D and Neutron.
 3. **It's honest about what it is.** No feature is decorative. The scorecard
-   in [`docs/AUDIT.md`](docs/AUDIT.md) grades the project 3.4 → 7.5 against
-   8 dimensions and lists exactly what is still missing.
+   in [`docs/AUDIT.md`](docs/AUDIT.md) grades the project 3.4 → **8.0**
+   against 8 dimensions and lists exactly what is still missing.
 
 ---
 
@@ -158,13 +160,31 @@ Named hardware cards always show your gear — connected (🟢) or offline (⚫)
 
 Any class-compliant USB MIDI device works — it just won't get a named card.
 
-### Clock
+### Clock — master or slave
 
-The clock is **derived from the AudioContext**, with count-based pulse
-emission: the number of pulses sent is a function of elapsed audio time, so
-the average tempo is exact and there is no accumulating drift. Changing the
+**CLOCK → Internal** (default): MusicBox generates the clock and drives
+the hardware. The pulse count is derived from the AudioContext, so the
+average tempo is exact and there is no accumulating drift. Changing the
 BPM re-times the pulse train instead of restarting the song, so hardware
 slaves keep their position.
+
+**CLOCK → External**: MusicBox becomes a **slave**. It stops sending its
+own clock, listens for incoming `0xF8` / `0xFA` / `0xFB` / `0xFC`, estimates
+the tempo, and schedules every step on the **hardware's own pulse grid** —
+so it lands in phase, not merely at the same average tempo.
+
+### MIDI Learn
+
+Any control marked with a **◉** badge can be bound to a hardware control:
+
+1. Click the badge.
+2. Move a knob on the device.
+3. The control is mapped, and the badge shows the CC number.
+
+The mapping is **bidirectional** — moving the control in the app also moves
+the hardware — and it is saved, so it survives a reload. Master volume,
+swing, tempo, every track fader, the spatial FX and the synth parameters
+are all learnable.
 
 ### Accent → Hardware
 
@@ -189,6 +209,27 @@ Each track has an `audioMode` property, switchable from the track header:
 
 Each track also has a **MIDI output target** dropdown, so a drum machine and
 a bass synth can be driven independently.
+
+---
+
+## ⚙️ Synth Parameters
+
+Every track has a real front panel. Select a track in the **SYNTH** panel
+and dial it in.
+
+| Control | What it does |
+|---|---|
+| **Cutoff** | Base filter frequency |
+| **Reso** | Filter resonance (Q) |
+| **Env** | Filter envelope **depth** — how far the filter opens. Accent deepens this, it does not just get louder |
+| **Decay** | Filter envelope decay time |
+| **Drive** | Output saturation (asymmetric, like the 303's output stage) |
+| **Glide** | Portamento time for slides |
+| **Level** | Output level |
+| **Tune** | ±12 semitones — for drums this is the 606's tuning pot |
+
+The mapping is a pure function, so it is **unit-tested** rather than
+asserted by ear. Full details: [`docs/ENGINE.md`](docs/ENGINE.md).
 
 ---
 
@@ -260,17 +301,17 @@ npx --yes http-server -p 8080 -c-1 .
 ## 🧪 Tests
 
 ```bash
-npm test              # 130 tests: generator, DOM wiring, headless app smoke
-npm run test:browser  # 20 tests: real headless Chrome over DevTools
-npm run test:all      # 150 tests
+npm test              # 186 tests: generator, DOM wiring, headless app smoke
+npm run test:browser  #  36 tests: real headless Chrome over DevTools
+npm run test:all      # 222 tests
 ```
 
 | Suite | Tests | Covers |
 |---|:--:|---|
 | `tests/generate.test.mjs` | 57 | PRNG determinism, Bjorklund correctness, scale theory, the in-scale guarantee, drum-note validity, humanise, 32-step coverage |
-| `tests/dom.test.mjs` | 19 | Every DOM target exists, script load order, generator wiring, CSS coverage, breakpoints |
-| `tests/smoke.test.mjs` | 54 | Boot, undo/redo, generator↔sequencer, persistence round-trip, MIDI export bytes, clock behaviour, per-track routing |
-| `tests/browser.test.mjs` | 20 | Real Chrome: grid, generator, mixer, keyboard, transport, zero uncaught exceptions |
+| `tests/dom.test.mjs` | 25 | Every DOM target exists, script load order, generator + MIDI controller wiring, CSS coverage, breakpoints |
+| `tests/smoke.test.mjs` | 104 | Boot, undo/redo, generator↔sequencer, persistence round-trip, MIDI export bytes, clock behaviour, per-track routing, **MIDI Learn round trip**, **synthesis model monotonicity** |
+| `tests/browser.test.mjs` | 36 | Real Chrome: grid, generator, patch preview, mixer, keyboard, synth panel, learn badges + learn flow, clock source switch, **zero uncaught exceptions** |
 
 ---
 
@@ -287,13 +328,15 @@ musicbox/
 │   ├── audio.js        # TR-606 drums + TB-303 acid + synth voices
 │   ├── sampler.js      # Strudel sample loader (namespaced, pre-fetched)
 │   ├── midi.js         # Web MIDI — clock, routing, CC profiles
+│   ├── midilearn.js    # ★ MIDI Learn — bidirectional, persisted
 │   ├── sequencer.js    # Scheduler (absolute-time), undo/redo, state
 │   ├── storage.js      # Versioned projects, autosave, MIDI export
 │   ├── ui.js           # Rendering — grid, generator panel, mixer, devices
 │   └── app.js          # Entry point — wiring
-├── tests/              # 150 automated tests
+├── tests/              # 222 automated tests
 └── docs/
     ├── AUDIT.md        # ★ Scorecard, findings, roadmap, known limitations
+    ├── ENGINE.md       # ★ Synthesis + MIDI reference
     └── superpowers/
 ```
 
@@ -308,17 +351,20 @@ musicbox/
 - [x] Euclidean rhythms, chord progressions, motif development, humanise
 - [x] Per-track MIDI output routing and Internal/MIDI/Both switching
 - [x] Drift-free MIDI clock; wired device CC profiles
+- [x] **MIDI Learn** — bidirectional, persisted
+- [x] **Master / slave clock** — follow an external MIDI clock
+- [x] **Per-track synth parameters** — cutoff, env, reso, decay, drive, glide, tune
 - [x] Lossless versioned persistence, redo, faithful MIDI export
 - [x] Responsive layout, accessibility pass, automated test suite
-- [ ] MIDI Learn (click a control, move a knob)
-- [ ] External clock / slave mode
 - [ ] "Generate 16 variations" picker
 - [ ] Pattern bank + song arranger
 - [ ] Per-track insert FX (EQ, saturation, chorus, sidechain)
 - [ ] Audio recording to WAV
 - [ ] LFO / modulation matrix
+- [ ] 303/606 A/B against reference recordings
 
-See [`docs/AUDIT.md`](docs/AUDIT.md) for the full backlog with effort estimates.
+See [`docs/AUDIT.md`](docs/AUDIT.md) for the full backlog with effort estimates
+and [`docs/ENGINE.md`](docs/ENGINE.md) for the synthesis reference.
 
 ---
 
