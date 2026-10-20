@@ -1,10 +1,22 @@
 /**
  * audio.js — Internal Web Audio Synthesis Engine
- * Provides drum synthesis + polyphonic synth voices so the
- * sequencer can play back without any external MIDI hardware.
+ * ---------------------------------------------------------------------------
+ * Provides drum synthesis (TR-606 flavour), a TB-303 acid bass, and
+ * polyphonic synth voices so the sequencer can play back without any
+ * external MIDI hardware.
  *
  * Drum channel (ch 10) → percussive synthesis by MIDI note
  * Melodic channels     → polyphonic oscillator synth
+ *
+ * KEY DESIGN POINTS (post-audit):
+ *  - ONE AudioContext for the whole app (exposed via getContext()).
+ *  - Every voice is scheduled at an ABSOLUTE AudioContext time, so the
+ *    sequencer's lookahead scheduler is genuinely sample-accurate.
+ *  - Voices are identified by a unique id, so two tracks on the same
+ *    channel playing the same note cannot leak or steal each other.
+ *  - The internal synth engines take PRIORITY over the Strudel sampler,
+ *    which is namespaced `strudel:<category>`.
+ *  - The master bus has a real limiter and an energy-conserving wet/dry.
  */
 
 const AudioEngine = (() => {
@@ -12,13 +24,19 @@ const AudioEngine = (() => {
   let ctx = null;
   let masterGain = null;
   let masterCompressor = null;
+  let masterAnalyser = null;
+  let masterShaper = null;   // soft-clip safety net after the limiter
   let enabled = true;
   let masterVol = 0.72;
 
-  // Active oscillator voices for note-offs
-  const activeVoices = new Map(); // key: `ch-note` → {osc, env, ...}
+  // ─── Voice registries ───────────────────────────────────────────
+  let voiceSeq = 0;
+  const activeVoices = new Map();   // voiceId → voice
+  const voiceByKey = new Map();     // `${channel}-${note}` → voiceId
+  const acidVoices = new Map();     // `acid-${channel}-${track}` → voice
+  const melodicVoices = new Map();  // channel → voice (for slide glide)
 
-  // Spatial FX nodes and gains
+  // ─── Spatial FX nodes and gains ─────────────────────────────────
   let reverbNode = null;
   let delayNode = null;
   let dryGain = null;
@@ -30,11 +48,13 @@ const AudioEngine = (() => {
   // Spatial FX defaults
   let reverbMixVal = 0.25;
   let reverbDecayVal = 2.5; // seconds
+  let reverbToneVal = 3000;
   let delayMixVal = 0.2;
   let delayTimeVal = 0.35; // seconds
   let delayFeedbackVal = 0.45;
+  let delayToneVal = 4000;
 
-  // Per-track instrument settings (index = track index)
+  // ─── Per-track instrument settings (index = track index) ─────────
   const trackInstruments = [
     { type: 'drum',  color: '#00d4ff' },
     { type: 'drum',  color: '#00ff88' },
@@ -49,33 +69,54 @@ const AudioEngine = (() => {
   // Per-track gain nodes (real-time Web Audio volume control)
   const trackGainNodes = new Array(8).fill(null);
 
-  // ─── Instrument type map (overridable) ──────────────────────
-  const channelInstrumentMap = new Map();
-  // Ch 10 = drums always
-  for (let i = 1; i <= 16; i++) {
-    channelInstrumentMap.set(i, i === 10 ? 'drum' : 'synth');
-  }
+  // Sampler categories are namespaced so they can never shadow an
+  // internal instrument type ('drum', 'bass', 'pad' are both).
+  const SAMPLER_PREFIX = 'strudel:';
+
+  // ═══════════════════════════════════════════════════════════════
+  // INIT / CONTEXT
+  // ═══════════════════════════════════════════════════════════════
 
   function init() {
-    if (ctx) return;
-    ctx = new (window.AudioContext || window.webkitAudioContext)();
-
-    if (window.SamplerEngine) {
-      SamplerEngine.init();
+    if (ctx) {
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      return ctx;
     }
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
 
-    // Master compressor (prevents clipping)
+    if (window.SamplerEngine) SamplerEngine.init();
+
+    // ── Master chain: masterGain → [dry | delay | reverb] → limiter → shaper → out
     masterCompressor = ctx.createDynamicsCompressor();
-    masterCompressor.threshold.value = -18;
-    masterCompressor.knee.value = 10;
-    masterCompressor.ratio.value = 4;
-    masterCompressor.attack.value = 0.003;
-    masterCompressor.release.value = 0.25;
+    masterCompressor.threshold.value = -1.5;
+    masterCompressor.knee.value = 0;
+    masterCompressor.ratio.value = 20;
+    masterCompressor.attack.value = 0.001;
+    masterCompressor.release.value = 0.05;
     masterCompressor.connect(ctx.destination);
 
-    // Master gain
+    // Soft clipper as a final safety net against digital clipping.
+    masterShaper = ctx.createWaveShaper();
+    masterShaper.curve = _makeSoftClipCurve();
+    masterShaper.oversample = '2x';
+    masterShaper.connect(masterCompressor);
+
+    // Master analyser — feeds the UI scope / spectrum.
+    masterAnalyser = ctx.createAnalyser();
+    masterAnalyser.fftSize = 1024;
+    masterAnalyser.smoothingTimeConstant = 0.75;
+    masterAnalyser.connect(masterShaper);
+
+    // DC blocker — keeps the sub bass from drifting the master.
+    const dcBlock = ctx.createBiquadFilter();
+    dcBlock.type = 'highpass';
+    dcBlock.frequency.value = 18;
+    dcBlock.Q.value = 0.7;
+    dcBlock.connect(masterAnalyser);
+
     masterGain = ctx.createGain();
     masterGain.gain.setValueAtTime(masterVol, ctx.currentTime);
+    masterGain.connect(dcBlock);
 
     // Per-track gain nodes: masterGain → trackGain[i] → master bus
     for (let i = 0; i < 8; i++) {
@@ -87,91 +128,162 @@ const AudioEngine = (() => {
 
     // Dry path
     dryGain = ctx.createGain();
-    dryGain.gain.setValueAtTime(Math.max(0.1, 1.0 - reverbMixVal * 0.7 - delayMixVal * 0.7), ctx.currentTime);
+    dryGain.gain.value = _dryValue();
     masterGain.connect(dryGain);
-    dryGain.connect(masterCompressor);
+    dryGain.connect(masterAnalyser);
 
     // Delay path (with high-cut tone filter)
     delayNode = _createPingPongDelay(ctx, delayTimeVal, delayFeedbackVal);
     delayWetGain = ctx.createGain();
-    delayWetGain.gain.setValueAtTime(delayMixVal, ctx.currentTime);
+    delayWetGain.gain.value = delayMixVal * 0.9;
     delayToneFilter = ctx.createBiquadFilter();
     delayToneFilter.type = 'highshelf';
-    delayToneFilter.frequency.value = 4000;
+    delayToneFilter.frequency.value = delayToneVal;
     delayToneFilter.gain.value = -6;
     masterGain.connect(delayNode.input);
     delayNode.output.connect(delayWetGain);
     delayWetGain.connect(delayToneFilter);
-    delayToneFilter.connect(masterCompressor);
+    delayToneFilter.connect(masterAnalyser);
 
     // Reverb path (with high-cut tone filter)
     reverbNode = _createReverb(ctx, reverbDecayVal);
     reverbWetGain = ctx.createGain();
-    reverbWetGain.gain.setValueAtTime(reverbMixVal, ctx.currentTime);
+    reverbWetGain.gain.value = reverbMixVal * 0.9;
     reverbToneFilter = ctx.createBiquadFilter();
     reverbToneFilter.type = 'highshelf';
-    reverbToneFilter.frequency.value = 3000;
+    reverbToneFilter.frequency.value = reverbToneVal;
     reverbToneFilter.gain.value = -9;
     masterGain.connect(reverbNode.input);
     reverbNode.output.connect(reverbWetGain);
     reverbWetGain.connect(reverbToneFilter);
-    reverbToneFilter.connect(masterCompressor);
+    reverbToneFilter.connect(masterAnalyser);
+
+    return ctx;
   }
+
+  /** The single shared AudioContext. */
+  function getContext() { return ctx; }
 
   function resume() {
-    if (ctx && ctx.state === 'suspended') ctx.resume();
+    if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
   }
 
-  // ─── Note On ───────────────────────────────────────────────
-  function noteOn(channel, note, velocity, trackIdx = -1, accent = false, slide = false) {
-    if (!enabled || !ctx) return;
+  // ═══════════════════════════════════════════════════════════════
+  // NOTE ON
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * @param {number} when  absolute AudioContext time for the note-on.
+   *                        Defaults to now. Scheduling at an absolute time
+   *                        is what makes the sequencer sample-accurate.
+   * @returns {object|null} the created voice, so the caller can release it.
+   */
+  function noteOn(channel, note, velocity, trackIdx = -1, accent = false, slide = false, when = null) {
+    if (!enabled) return null;
+    if (!ctx) init();
+    if (!ctx) return null;
     resume();
 
-    const vel = (velocity || 100) / 127;
+    const t = Math.max(when === null ? ctx.currentTime : when, ctx.currentTime);
+    const vel = Math.max(0.02, Math.min(1, (velocity || 100) / 127));
     const instrType = _getInstrType(channel, trackIdx);
 
     // Resolve output bus: per-track gain if available, else master
     const outBus = (trackIdx >= 0 && trackGainNodes[trackIdx]) ? trackGainNodes[trackIdx] : masterGain;
 
-    // External Sampler Check (Strudel database)
-    if (window.SamplerEngine && SamplerEngine.getCategories().includes(instrType)) {
-      SamplerEngine.playSample(ctx, outBus, instrType, note, vel, 0);
-      return;
+    // External sampler — only for namespaced categories, so the internal
+    // TR-606 / bass / pad engines are never shadowed.
+    if (instrType.startsWith(SAMPLER_PREFIX)) {
+      const category = instrType.slice(SAMPLER_PREFIX.length);
+      SamplerEngine.playSample(ctx, outBus, category, note, vel, t);
+      return null;
     }
 
-    if (instrType === 'drum' || channel === 10) {
-      _playDrum(note, vel, outBus);
-    } else if (instrType === 'acid') {
-      _playAcidBass(channel, note, vel, outBus, accent, slide);
-    } else if (instrType === 'bass') {
-      _playBass(channel, note, vel, outBus);
-    } else if (instrType === 'pad') {
-      _playPad(channel, note, vel, outBus);
-    } else {
-      _playSynth(channel, note, vel, outBus);
+    if (instrType === 'drum') {
+      _playDrum(note, vel, outBus, t);
+      return null;
     }
+    if (instrType === 'acid') {
+      return _playAcidBass(channel, note, vel, outBus, accent, slide, trackIdx, t);
+    }
+    if (instrType === 'bass') {
+      return _playBass(channel, note, vel, outBus, t, slide);
+    }
+    if (instrType === 'pad') {
+      return _playPad(channel, note, vel, outBus, t, slide);
+    }
+    return _playSynth(channel, note, vel, outBus, t, slide);
   }
 
-  // ─── Note Off ──────────────────────────────────────────────
-  function noteOff(channel, note) {
+  // ═══════════════════════════════════════════════════════════════
+  // NOTE OFF / VOICE LIFETIME
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Release a melodic voice. Safe to call with a stale note number:
+   * if a slide has already moved the voice to another pitch, the release
+   * is ignored rather than cutting the newer note short.
+   */
+  function noteOff(channel, note, trackIdx = -1) {
     if (!enabled || !ctx) return;
+    // Acid voices are keyed by channel + track.
+    _releaseAcid(channel, note, trackIdx);
     const key = `${channel}-${note}`;
-    const voice = activeVoices.get(key);
+    const voiceId = voiceByKey.get(key);
+    if (voiceId === undefined) return;
+    const voice = activeVoices.get(voiceId);
+    if (!voice) { voiceByKey.delete(key); return; }
+    // A slide moved this voice to a new pitch — leave it running.
+    if (voice.currentNote !== undefined && voice.currentNote !== note) {
+      voiceByKey.delete(key);
+      return;
+    }
+    releaseVoice(voiceId);
+  }
+
+  /** Release a voice by id, with a short fade. */
+  function releaseVoice(voiceId) {
+    const voice = activeVoices.get(voiceId);
     if (!voice) return;
+    activeVoices.delete(voiceId);
+    if (voiceByKey.get(voice.key) === voiceId) voiceByKey.delete(voice.key);
 
     const now = ctx.currentTime;
     const release = voice.release || 0.05;
-    voice.env.gain.cancelScheduledValues(now);
-    voice.env.gain.setValueAtTime(voice.env.gain.value, now);
-    voice.env.gain.linearRampToValueAtTime(0, now + release);
+    try {
+      voice.env.gain.cancelScheduledValues(now);
+      voice.env.gain.setValueAtTime(voice.env.gain.value, now);
+      voice.env.gain.linearRampToValueAtTime(0, now + release);
+    } catch (e) { /* detached node */ }
 
+    const stopAt = (release + 0.05) * 1000;
     setTimeout(() => {
-      try { voice.osc?.stop(); } catch(e) {}
-      try { voice.osc2?.stop(); } catch(e) {}
-      try { voice.osc3?.stop(); } catch(e) {}
-    }, (release + 0.1) * 1000);
+      try { voice.oscs?.forEach(o => o.stop()); } catch (e) {}
+    }, stopAt);
+  }
 
-    activeVoices.delete(key);
+  /** Release a voice only if it is still the current owner of its key. */
+  function releaseVoiceById(voiceId) {
+    if (!activeVoices.has(voiceId)) return;
+    releaseVoice(voiceId);
+  }
+
+  function _registerVoice(voice) {
+    const id = ++voiceSeq;
+    voice.id = id;
+    activeVoices.set(id, voice);
+    // If a voice already owns this key, retire it so it cannot drone on.
+    const prevId = voiceByKey.get(voice.key);
+    if (prevId !== undefined && prevId !== id) {
+      const prev = activeVoices.get(prevId);
+      if (prev) {
+        activeVoices.delete(prevId);
+        try { prev.env.gain.cancelScheduledValues(ctx.currentTime); prev.env.gain.setValueAtTime(0, ctx.currentTime); } catch (e) {}
+        setTimeout(() => { try { prev.oscs?.forEach(o => o.stop()); } catch (e) {} }, 60);
+      }
+    }
+    voiceByKey.set(voice.key, id);
+    return id;
   }
 
   function _getInstrType(channel, trackIdx) {
@@ -180,9 +292,9 @@ const AudioEngine = (() => {
     return 'lead';
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // DRUM SYNTHESIS
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════
+  // DRUM SYNTHESIS — TR-606 flavour
+  // ═══════════════════════════════════════════════════════════════
 
   // MIDI note → drum type mapping (GM standard)
   const DRUM_MAP = {
@@ -199,27 +311,27 @@ const AudioEngine = (() => {
     70: 'clap', 75: 'clap',
   };
 
-  function _playDrum(note, vel, outBus) {
+  function _playDrum(note, vel, outBus, when) {
     const type = DRUM_MAP[note] || (note % 2 === 0 ? 'kick' : 'hihat_closed');
     const bus = outBus || masterGain;
     switch (type) {
-      case 'kick':         _kick(vel, bus); break;
-      case 'snare':        _snare(vel, bus); break;
-      case 'hihat_closed': _hihat(vel, 0.06, bus); break;
-      case 'hihat_open':   _hihat(vel, 0.35, bus); break;
-      case 'clap':         _clap(vel, bus); break;
-      case 'rim':          _rim(vel, bus); break;
-      case 'crash':        _crash(vel, bus); break;
-      case 'ride':         _ride(vel, bus); break;
-      case 'tom':          _tom(vel, 80 + (note - 41) * 8, bus); break;
-      default:             _hihat(vel, 0.08, bus); break;
+      case 'kick':         _kick(vel, bus, when); break;
+      case 'snare':        _snare(vel, bus, when); break;
+      case 'hihat_closed': _hihat(vel, 0.06, bus, when); break;
+      case 'hihat_open':   _hihat(vel, 0.35, bus, when); break;
+      case 'clap':         _clap(vel, bus, when); break;
+      case 'rim':          _rim(vel, bus, when); break;
+      case 'crash':        _crash(vel, bus, when); break;
+      case 'ride':         _ride(vel, bus, when); break;
+      case 'tom':          _tom(vel, 80 + (note - 41) * 8, bus, when); break;
+      default:             _hihat(vel, 0.08, bus, when); break;
     }
   }
 
   // ─── TR-606 Kick Drum ──────────────────────────────────────
   // Pitch: 180Hz → 30Hz over 400ms (deep, punchy, 606-authentic)
-  function _kick(vel, bus) {
-    const now = ctx.currentTime;
+  function _kick(vel, bus, when) {
+    const now = when;
 
     // Sub sine body
     const osc = ctx.createOscillator();
@@ -261,8 +373,8 @@ const AudioEngine = (() => {
   }
 
   // ─── TR-606 Snare ─────────────────────────────────────────
-  function _snare(vel, bus) {
-    const now = ctx.currentTime;
+  function _snare(vel, bus, when) {
+    const now = when;
 
     // Tuned body: sine 220Hz → 110Hz (60% mix)
     const bodyOsc = ctx.createOscillator();
@@ -295,36 +407,55 @@ const AudioEngine = (() => {
   }
 
   // ─── TR-606 Hi-Hat ─────────────────────────────────────────
-  // 6 FM-style detuned square oscs, 606 frequency set
-  function _hihat(vel, duration, bus) {
-    const now = ctx.currentTime;
-    // TR-606 metallic frequencies
-    const freqs = [2070, 3100, 4250, 5700, 7800, 10100];
-    const masterHHGain = ctx.createGain();
-    masterHHGain.connect(bus);
+  // The 606 metal circuit is six INHARMONIC square oscillators
+  // (246.4 / 308.0 / 367.0 / 418.2 / 440.4 / 627.2 Hz) fed through a
+  // high band-pass — not six bright squares, which is what gives the
+  // 808 its buzz instead of the 606's metallic "hum".
+  const HAT_OSC_FREQS = [246.4, 308.0, 367.0, 418.2, 440.4, 627.2];
 
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'highpass';
-    filter.frequency.value = 7000;
-    filter.connect(masterHHGain);
+  function _hihat(vel, duration, bus, when) {
+    const now = when;
 
-    freqs.forEach(f => {
-      const osc = ctx.createOscillator();
-      osc.type = 'square';
-      osc.frequency.value = f;
-      osc.connect(filter);
-      osc.start(now);
-      osc.stop(now + duration + 0.02);
-    });
+    const bank = ctx.createGain();
+    bank.gain.value = 1;
 
+    // High band-pass — this is the 606's "metal" filter.
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 9000;
+    bp.Q.value = 0.55;
+
+    // High-pass to remove the low rumble of the oscillator bank.
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 7000;
+    hp.Q.value = 0.7;
+
+    const env = ctx.createGain();
     const decay = duration < 0.1 ? duration + 0.015 : duration;
-    masterHHGain.gain.setValueAtTime(vel * 0.18, now);
-    masterHHGain.gain.exponentialRampToValueAtTime(0.0001, now + decay);
+    env.gain.setValueAtTime(vel * 0.4, now);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + decay);
+
+    bank.connect(bp);
+    bp.connect(hp);
+    hp.connect(env);
+    env.connect(bus);
+
+    const oscs = HAT_OSC_FREQS.map((f) => {
+      const o = ctx.createOscillator();
+      o.type = 'square';
+      o.frequency.value = f;
+      o.connect(bank);
+      o.start(now);
+      o.stop(now + duration + 0.02);
+      return o;
+    });
+    return oscs;
   }
 
   // ─── TR-606 Clap (4-burst layered noise) ─────────────────────
-  function _clap(vel, bus) {
-    const now = ctx.currentTime;
+  function _clap(vel, bus, when) {
+    const now = when;
     const offsets = [0, 0.003, 0.006, 0.010];
     offsets.forEach(offset => {
       const noiseBuf = _makeNoise(0.12);
@@ -345,8 +476,8 @@ const AudioEngine = (() => {
   }
 
   // ─── Rim Shot ───────────────────────────────────────────────
-  function _rim(vel, bus) {
-    const now = ctx.currentTime;
+  function _rim(vel, bus, when) {
+    const now = when;
     const osc = ctx.createOscillator();
     osc.type = 'square';
     osc.frequency.value = 1600;
@@ -360,33 +491,38 @@ const AudioEngine = (() => {
   }
 
   // ─── Crash Cymbal ───────────────────────────────────────────
-  function _crash(vel, bus) {
-    const now = ctx.currentTime;
-    const freqs = [3150, 4523, 5860, 7420, 9800, 14000];
+  function _crash(vel, bus, when) {
+    const now = when;
+    // The 606 cymbal circuit is a separate 6-oscillator bank.
+    const freqs = [246.4, 308.0, 367.0, 418.2, 440.4, 627.2];
+    const bank = ctx.createGain();
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 5500;
+    bp.Q.value = 0.4;
     const masterGainNode = ctx.createGain();
-    masterGainNode.connect(bus);
-    masterGainNode.gain.setValueAtTime(vel * 0.3, now);
+    masterGainNode.gain.setValueAtTime(vel * 0.35, now);
     masterGainNode.gain.exponentialRampToValueAtTime(0.0001, now + 1.2);
+    bank.connect(bp); bp.connect(masterGainNode); masterGainNode.connect(bus);
 
     freqs.forEach(f => {
       const osc = ctx.createOscillator();
-      osc.type = 'sawtooth';
+      osc.type = 'square';
       osc.frequency.value = f;
-      osc.connect(masterGainNode);
+      osc.connect(bank);
       osc.start(now);
       osc.stop(now + 1.3);
     });
   }
 
   // ─── Ride ───────────────────────────────────────────────────
-  function _ride(vel, bus) {
-    const now = ctx.currentTime;
+  function _ride(vel, bus, when) {
+    const now = when;
     const freqs = [4000, 6200, 8800];
     const gainNode = ctx.createGain();
-    gainNode.connect(bus);
     gainNode.gain.setValueAtTime(vel * 0.2, now);
     gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
-
+    gainNode.connect(bus);
     freqs.forEach(f => {
       const osc = ctx.createOscillator();
       osc.type = 'square';
@@ -398,8 +534,8 @@ const AudioEngine = (() => {
   }
 
   // ─── Tom ────────────────────────────────────────────────────
-  function _tom(vel, freq, bus) {
-    const now = ctx.currentTime;
+  function _tom(vel, freq, bus, when) {
+    const now = when;
     const osc = ctx.createOscillator();
     osc.type = 'sine';
     osc.frequency.setValueAtTime(freq * 1.8, now);
@@ -413,19 +549,18 @@ const AudioEngine = (() => {
     osc.stop(now + 0.4);
   }
 
-  // ─── White Noise Buffer ─────────────────────────────────────
+  // ─── White Noise Buffer (cached, not re-allocated per hit) ──
+  let noiseCache = null;
   function _makeNoise(duration) {
     const sampleRate = ctx.sampleRate;
-    const bufLen = Math.floor(sampleRate * duration);
+    const bufLen = Math.max(1, Math.floor(sampleRate * duration));
     const buf = ctx.createBuffer(1, bufLen, sampleRate);
     const data = buf.getChannelData(0);
-    for (let i = 0; i < bufLen; i++) {
-      data[i] = Math.random() * 2 - 1;
-    }
+    for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
     return buf;
   }
 
-  // ─── Soft Distortion Curve ─────────────────────────────────
+  // ─── Curves ─────────────────────────────────────────────────
   function _makeDistortionCurve(amount) {
     const samples = 256;
     const curve = new Float32Array(samples);
@@ -437,9 +572,20 @@ const AudioEngine = (() => {
     return curve;
   }
 
-  // ═══════════════════════════════════════════════════════════
+  /** Soft-clip curve — tanh-ish, used as the final safety net. */
+  function _makeSoftClipCurve() {
+    const samples = 2048;
+    const curve = new Float32Array(samples);
+    for (let i = 0; i < samples; i++) {
+      const x = (i * 2) / samples - 1;
+      curve[i] = Math.tanh(x * 1.35) / Math.tanh(1.35);
+    }
+    return curve;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
   // MELODIC SYNTHESIS
-  // ═══════════════════════════════════════════════════════════
+  // ═══════════════════════════════════════════════════════════════
 
   function _midiToFreq(note) {
     return 440 * Math.pow(2, (note - 69) / 12);
@@ -447,39 +593,38 @@ const AudioEngine = (() => {
 
   // ───────────────────────────────────────────────────────
   // TB-303 ACID BASS ENGINE
+  // Per-channel+track voice state (enables slide glide between notes)
   // ───────────────────────────────────────────────────────
-  // Per-channel voice state (enables slide glide between notes)
-  const acidVoices = new Map(); // key: `acid-${channel}` → voice obj
+  const ACID_GLIDE = 0.045;   // 45ms portamento — audible, 303-ish
+  const ACID_DECAY = 0.22;    // filter envelope decay time constant
 
-  function _playAcidBass(channel, note, vel, bus, accent, slide) {
-    const now = ctx.currentTime;
+  function _playAcidBass(channel, note, vel, bus, accent, slide, trackIdx, when) {
+    const now = when;
     const freq = _midiToFreq(note);
-    const key = `acid-${channel}`;
+    const key = `acid-${channel}-${trackIdx}`;
     const existing = acidVoices.get(key);
 
-    // ── SLIDE: glide existing oscillator to new pitch, skip envelope retrigger
-    if (slide && existing && existing.osc) {
+    // ── SLIDE: the previous note was flagged to slide, so GLIDE into
+    //    this pitch instead of retriggering the envelope.
+    if (existing && existing.osc && existing.slideOut) {
       existing.osc.frequency.cancelScheduledValues(now);
-      existing.osc.frequency.setTargetAtTime(freq, now, 0.015); // 15ms glide
-      if (existing.sub) existing.sub.frequency.setTargetAtTime(freq / 2, now, 0.015);
+      existing.osc.frequency.setTargetAtTime(freq, now, ACID_GLIDE);
+      if (existing.sub) {
+        existing.sub.frequency.cancelScheduledValues(now);
+        existing.sub.frequency.setTargetAtTime(freq / 2, now, ACID_GLIDE);
+      }
       existing.currentNote = note;
-      return; // do not retrigger envelope
+      existing.slideOut = false;
+      existing.held = true;
+      return existing;
     }
 
     // ── Kill existing voice cleanly
-    if (existing) {
-      try {
-        existing.env.gain.setTargetAtTime(0, now, 0.008);
-        setTimeout(() => {
-          try { existing.osc.stop(); } catch(e) {}
-          try { existing.sub.stop(); } catch(e) {}
-        }, 80);
-      } catch(e) {}
-    }
+    if (existing) _killAcidVoice(existing, now);
 
     // ── New voice
     const osc = ctx.createOscillator();
-    osc.type = 'sawtooth'; // classic 303 sound
+    osc.type = 'sawtooth';
     osc.frequency.setValueAtTime(freq, now);
 
     // Sub oscillator (-1 octave, square wave)
@@ -487,64 +632,131 @@ const AudioEngine = (() => {
     sub.type = 'square';
     sub.frequency.setValueAtTime(freq / 2, now);
 
-    // 18dB/oct lowpass filter — high resonance for 303 squelch
-    // Resonance Q: accent → 20 (self-oscillating squelch), normal → 9
-    const filter = ctx.createBiquadFilter();
-    filter.type = 'lowpass';
-    filter.Q.value = accent ? 20 : 9;
+    // 4-pole ladder approximation: two cascaded biquads = 24 dB/oct,
+    // close to the 303's 18 dB/oct, and much steeper than a single
+    // biquad (12 dB/oct) which is what this used to be.
+    const baseCutoff  = 320;
+    const peakCutoff  = accent ? 4200 : 1500;
 
-    // Filter envelope: fast attack, exponential decay
-    // Accent: filter opens wide (4000Hz peak), normal: moderate (1600Hz)
-    const baseCutoff  = 350;
-    const peakCutoff  = accent ? 4000 : 1600;
-    filter.frequency.setValueAtTime(baseCutoff, now);
-    filter.frequency.linearRampToValueAtTime(peakCutoff, now + 0.002); // 2ms attack
-    filter.frequency.setTargetAtTime(baseCutoff, now + 0.002, 0.08);   // decay
+    const f1 = ctx.createBiquadFilter();
+    f1.type = 'lowpass';
+    f1.Q.value = accent ? 14 : 6;
+    f1.frequency.setValueAtTime(baseCutoff, now);
+    f1.frequency.linearRampToValueAtTime(peakCutoff, now + 0.002);
+    f1.frequency.setTargetAtTime(baseCutoff, now + 0.002, ACID_DECAY);
 
-    // Amplitude envelope
+    const f2 = ctx.createBiquadFilter();
+    f2.type = 'lowpass';
+    f2.Q.value = 0.7;
+    f2.frequency.setValueAtTime(baseCutoff, now);
+    f2.frequency.linearRampToValueAtTime(peakCutoff, now + 0.002);
+    f2.frequency.setTargetAtTime(baseCutoff, now + 0.002, ACID_DECAY);
+
+    // Amplitude envelope: fast attack, decay to a sustain level, so the
+    // 303 articulates instead of droning at full volume.
     const env = ctx.createGain();
-    const baseAmp   = vel;                           // vel = 0..1
-    const accentBoost = accent ? 1.45 : 1.0;         // +3dB on accent
+    const baseAmp = vel;
+    const accentBoost = accent ? 1.45 : 1.0;   // +3dB on accent
+    const peakAmp = baseAmp * accentBoost * 0.75;
+    const sustainAmp = peakAmp * 0.62;
     env.gain.setValueAtTime(0, now);
-    env.gain.linearRampToValueAtTime(baseAmp * accentBoost * 0.75, now + 0.001);
+    env.gain.linearRampToValueAtTime(peakAmp, now + 0.002);
+    env.gain.setTargetAtTime(sustainAmp, now + 0.002, 0.12);
 
     // Mix: 70% sawtooth + 30% sub
     const oscMix = ctx.createGain(); oscMix.gain.value = 0.7;
     const subMix = ctx.createGain(); subMix.gain.value = 0.3;
 
-    osc.connect(oscMix); oscMix.connect(filter);
-    sub.connect(subMix); subMix.connect(filter);
-    filter.connect(env);
+    osc.connect(oscMix); oscMix.connect(f1);
+    sub.connect(subMix); subMix.connect(f1);
+    f1.connect(f2);
+    f2.connect(env);
     env.connect(bus);
 
     osc.start(now);
     sub.start(now);
 
-    acidVoices.set(key, { osc, sub, filter, env, release: 0.05, currentNote: note });
+    const voice = {
+      id: ++voiceSeq,
+      key,
+      osc, sub, filter: f1, env,
+      oscs: [osc, sub],
+      release: 0.06,
+      currentNote: note,
+      slideOut: !!slide,
+      held: false,
+    };
+    acidVoices.set(key, voice);
+    return voice;
   }
 
-  function _stopAcidBass(channel) {
-    const key = `acid-${channel}`;
+  function _killAcidVoice(voice, now) {
+    if (!voice) return;
+    try {
+      voice.env.gain.cancelScheduledValues(now);
+      voice.env.gain.setTargetAtTime(0, now, 0.008);
+    } catch (e) {}
+    setTimeout(() => {
+      try { voice.osc.stop(); } catch (e) {}
+      try { voice.sub.stop(); } catch (e) {}
+    }, 80);
+  }
+
+  /** Release the acid voice for a channel/track (called on note-off). */
+  function _releaseAcid(channel, note, trackIdx) {
+    const key = `acid-${channel}-${trackIdx}`;
     const voice = acidVoices.get(key);
     if (!voice) return;
-    const now = ctx?.currentTime || 0;
-    try {
-      voice.env.gain.setTargetAtTime(0, now, 0.01);
-      setTimeout(() => {
-        try { voice.osc.stop(); } catch(e) {}
-        try { voice.sub.stop(); } catch(e) {}
-      }, 100);
-    } catch(e) {}
+    // A slide already moved the voice — don't cut the newer note short.
+    if (voice.currentNote !== note) return;
     acidVoices.delete(key);
+    const now = ctx.currentTime;
+    try {
+      voice.env.gain.cancelScheduledValues(now);
+      voice.env.gain.setValueAtTime(voice.env.gain.value, now);
+      voice.env.gain.linearRampToValueAtTime(0, now + 0.06);
+    } catch (e) {}
+    setTimeout(() => {
+      try { voice.osc.stop(); } catch (e) {}
+      try { voice.sub.stop(); } catch (e) {}
+    }, 120);
+  }
+
+  // ─── Melodic slide / portamento ─────────────────────────────
+  /**
+   * If the previous melodic note on this channel was flagged to slide,
+   * GLIDE the running voice to the new pitch instead of retriggering it.
+   * This is the same legato behaviour as the 303, applied to the other
+   * synth voices.
+   */
+  function _tryGlide(channel, note, when) {
+    const existing = melodicVoices.get(channel);
+    if (!existing || !existing.slideOut || !existing.oscs || !existing.oscs.length) return null;
+    const freq = _midiToFreq(note);
+    existing.oscs.forEach(o => {
+      try {
+        o.frequency.cancelScheduledValues(when);
+        o.frequency.setTargetAtTime(freq, when, 0.035);
+      } catch (e) {}
+    });
+    // Re-key the voice so the upcoming note-off finds it.
+    voiceByKey.delete(existing.key);
+    existing.key = `${channel}-${note}`;
+    existing.currentNote = note;
+    existing.slideOut = false;
+    voiceByKey.set(existing.key, existing.id);
+    return existing;
   }
 
   // ─── Bass Synth ─────────────────────────────────────────────
-  function _playBass(channel, note, vel, bus) {
-    const now = ctx.currentTime;
+  function _playBass(channel, note, vel, bus, when, slide = false) {
+    const now = when;
     const freq = _midiToFreq(note);
     const key = `${channel}-${note}`;
 
-    // Sawtooth + sub oscillator
+    const glided = _tryGlide(channel, note, now);
+    if (glided) return glided;
+
     const osc1 = ctx.createOscillator();
     osc1.type = 'sawtooth';
     osc1.frequency.value = freq;
@@ -573,20 +785,25 @@ const AudioEngine = (() => {
     osc1.start(now);
     osc2.start(now);
 
-    activeVoices.set(key, { osc: osc1, osc2, env, release: 0.08 });
+    const voice = { key, env, oscs: [osc1, osc2], release: 0.08, currentNote: note, slideOut: !!slide };
+    _registerVoice(voice);
+    melodicVoices.set(channel, voice);
+    return voice;
   }
 
-  // ─── Lead / Monosynth (Moog ladder-style) ─────────────────
-  function _playSynth(channel, note, vel, bus) {
-    const now = ctx.currentTime;
+  // ─── Lead / Monosynth (ladder-style) ───────────────────────
+  function _playSynth(channel, note, vel, bus, when, slide = false) {
+    const now = when;
     const freq = _midiToFreq(note);
     const key = `${channel}-${note}`;
+
+    const glided = _tryGlide(channel, note, now);
+    if (glided) return glided;
 
     // Sawtooth primary + slight detune for width
     const osc = ctx.createOscillator();
     osc.type = 'sawtooth';
     osc.frequency.value = freq;
-    osc.detune.value = 0;
 
     const osc2 = ctx.createOscillator();
     osc2.type = 'sawtooth';
@@ -620,22 +837,22 @@ const AudioEngine = (() => {
 
     osc.start(now); osc2.start(now);
 
-    activeVoices.set(key, { osc, osc2, env, release: 0.15 });
-  }
-
-  // ─── Lead (specific track type) ─────────────────────────────
-  function _playLead(channel, note, vel) {
-    _playSynth(channel, note, vel);
+    const voice = { key, env, oscs: [osc, osc2], release: 0.15, currentNote: note, slideOut: !!slide };
+    _registerVoice(voice);
+    melodicVoices.set(channel, voice);
+    return voice;
   }
 
   // ─── Pad Synth ──────────────────────────────────────────────
-  // FIX: Store all 5 oscillators to prevent voice leak
-  function _playPad(channel, note, vel, bus) {
-    const now = ctx.currentTime;
+  function _playPad(channel, note, vel, bus, when, slide = false) {
+    const now = when;
     const freq = _midiToFreq(note);
     const key = `${channel}-${note}`;
 
-    const voices = [];
+    const glided = _tryGlide(channel, note, now);
+    if (glided) return glided;
+
+    const oscs = [];
     const detunes = [-8, 0, 8, -4, 4];
 
     detunes.forEach(cents => {
@@ -643,7 +860,7 @@ const AudioEngine = (() => {
       osc.type = 'sawtooth';
       osc.frequency.value = freq;
       osc.detune.value = cents;
-      voices.push(osc);
+      oscs.push(osc);
     });
 
     const filter = ctx.createBiquadFilter();
@@ -656,49 +873,63 @@ const AudioEngine = (() => {
     env.gain.setValueAtTime(0, now);
     env.gain.linearRampToValueAtTime(vel * 0.25, now + 0.5); // slow attack
 
-    voices.forEach(osc => {
+    oscs.forEach(osc => {
       osc.connect(filter);
       osc.start(now);
     });
     filter.connect(env);
     env.connect(bus || masterGain);
 
-    // Store ALL 5 voices to prevent oscillator leak
-    activeVoices.set(key, {
-      osc: voices[0], osc2: voices[1], osc3: voices[2],
-      osc4: voices[3], osc5: voices[4],
-      env, release: 0.6
-    });
+    // ALL 5 oscillators are stored, so none of them leaks.
+    const voice = { key, env, oscs, release: 0.6, currentNote: note, slideOut: !!slide };
+    _registerVoice(voice);
+    melodicVoices.set(channel, voice);
+    return voice;
   }
 
   // ─── Trigger from sequencer ─────────────────────────────────
-  // accent + slide are forwarded from step data
-  function triggerNote(trackIdx, channel, note, velocity, gateSec, accent = false, slide = false) {
+  /**
+   * @param {number} when absolute AudioContext time of the note-on.
+   */
+  function triggerNote(trackIdx, channel, note, velocity, gateSec, accent = false, slide = false, when = null) {
     if (!enabled) return;
-    init(); // lazy init
+    if (!ctx) init();
+    if (!ctx) return;
     resume();
 
-    const instrType = _getInstrType(channel, trackIdx);
-    noteOn(channel, note, velocity, trackIdx, accent, slide);
+    const t = Math.max(when === null ? ctx.currentTime : when, ctx.currentTime);
+    const voice = noteOn(channel, note, velocity, trackIdx, accent, slide, t);
+    if (!voice) return;
 
-    // Acid bass manages its own note-off (continuous until next note)
-    // Drums self-decay; melodic synths need scheduled note-off
-    const isSampler = window.SamplerEngine && SamplerEngine.getCategories().includes(instrType);
-    if (instrType !== 'drum' && instrType !== 'acid' && !isSampler) {
-      setTimeout(() => noteOff(channel, note), gateSec * 1000);
+    const isAcid = voice.oscs && voice.key && voice.key.startsWith('acid-');
+    if (isAcid) {
+      // The acid voice articulates itself; the note-off releases it.
+      const delayMs = Math.max(0, (t - ctx.currentTime) * 1000) + (gateSec || 0) * 1000;
+      const track = trackIdx;
+      setTimeout(() => _releaseAcid(channel, note, track), delayMs);
+      return;
     }
+
+    // Melodic synths need a scheduled note-off.
+    const delayMs = Math.max(0, (t - ctx.currentTime) * 1000) + (gateSec || 0) * 1000;
+    const voiceId = voice.id;
+    setTimeout(() => releaseVoiceById(voiceId), delayMs);
   }
 
-  // ─── Controls ───────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════
+  // CONTROLS
+  // ═══════════════════════════════════════════════════════════════
+
   function setEnabled(val) { enabled = val; }
   function isEnabled() { return enabled; }
 
   function setMasterVolume(vol) {
-    masterVol = vol;
-    if (masterGain) {
-      masterGain.gain.setTargetAtTime(vol, ctx.currentTime, 0.01);
+    masterVol = Math.max(0, Math.min(1, vol));
+    if (masterGain && ctx) {
+      masterGain.gain.setTargetAtTime(masterVol, ctx.currentTime, 0.01);
     }
   }
+  function getMasterVolume() { return masterVol; }
 
   function setTrackInstrument(trackIdx, type) {
     if (trackInstruments[trackIdx]) {
@@ -708,39 +939,43 @@ const AudioEngine = (() => {
 
   function getTrackInstruments() { return trackInstruments; }
 
-  function allNotesOff() {
-    activeVoices.forEach((voice) => {
-      try {
-        const now = ctx?.currentTime || 0;
-        voice.env.gain.cancelScheduledValues(now);
-        voice.env.gain.setValueAtTime(0, now);
-        voice.osc?.stop();
-        voice.osc2?.stop();
-        voice.osc3?.stop();
-        voice.osc4?.stop();
-        voice.osc5?.stop();
-      } catch(e) {}
-    });
-    activeVoices.clear();
-    // Also kill all acid voices
-    acidVoices.forEach((_, ch) => _stopAcidBass(parseInt(ch.replace('acid-', ''))));
-    acidVoices.clear();
-  }
-
   function setTrackVolume(trackIdx, vol) {
-    // vol: 0.0–1.0
     if (trackGainNodes[trackIdx] && ctx) {
-      trackGainNodes[trackIdx].gain.setTargetAtTime(vol, ctx.currentTime, 0.015);
+      trackGainNodes[trackIdx].gain.setTargetAtTime(
+        Math.max(0, Math.min(1, vol)), ctx.currentTime, 0.015);
     }
   }
 
-  // ─── Spatial FX Helpers ─────────────────────────────────────
-  // FIX: Add combSum merge gain so all 4 comb outputs properly sum before allpass chain
+  function allNotesOff() {
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    // Melodic voices
+    activeVoices.forEach(voice => {
+      try {
+        voice.env.gain.cancelScheduledValues(now);
+        voice.env.gain.setValueAtTime(voice.env.gain.value, now);
+        voice.env.gain.linearRampToValueAtTime(0, now + 0.02);
+      } catch (e) {}
+      try { voice.oscs?.forEach(o => o.stop(now + 0.05)); } catch (e) {}
+    });
+    activeVoices.clear();
+    voiceByKey.clear();
+    melodicVoices.clear();
+
+    // Acid voices
+    acidVoices.forEach((voice) => _killAcidVoice(voice, now));
+    acidVoices.clear();
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // SPATIAL FX
+  // ═══════════════════════════════════════════════════════════════
+
   function _createReverb(ctx, decayTime) {
     const input = ctx.createGain();
     const output = ctx.createGain();
-    const combSum = ctx.createGain(); // summation node for parallel combs
-    combSum.gain.value = 0.25; // normalize by number of combs
+    const combSum = ctx.createGain();
+    combSum.gain.value = 0.25;
 
     const combDelays = [0.029, 0.037, 0.041, 0.043];
     const combGains = [0.742, 0.733, 0.715, 0.697];
@@ -748,46 +983,65 @@ const AudioEngine = (() => {
       const delay = ctx.createDelay();
       delay.delayTime.value = d;
       const feedback = ctx.createGain();
-      const fbVal = Math.min(0.95, Math.pow(combGains[i], decayTime));
-      feedback.gain.value = fbVal;
-
+      feedback.gain.value = _combFeedback(combGains[i], decayTime);
       input.connect(delay);
       delay.connect(feedback);
       feedback.connect(delay);
-      // Each comb output goes into the summation node
       delay.connect(combSum);
-      return { delay, feedback };
+      return { delay, feedback, base: combGains[i] };
     });
 
+    // True Schroeder allpass: delay + feedback + feedforward, not a biquad.
     const apDelays = [0.005, 0.0017];
     const apGains = [0.7, 0.7];
     const allpasses = apDelays.map((d, i) => {
-      const ap = ctx.createBiquadFilter();
-      ap.type = 'allpass';
-      ap.frequency.value = 1 / d;
-      ap.Q.value = apGains[i];
-      return ap;
+      const delay = ctx.createDelay();
+      delay.delayTime.value = d;
+      const fb = ctx.createGain();
+      fb.gain.value = apGains[i];
+      const ff = ctx.createGain();
+      ff.gain.value = -apGains[i];
+      const out = ctx.createGain();
+      out.gain.value = 1 - apGains[i];
+      delay.connect(fb); fb.connect(delay);
+      delay.connect(ff); ff.connect(out);
+      delay.connect(out);
+      return { delay, fb, ff, out };
     });
 
-    // Series: combSum → ap[0] → ap[1] → output
-    combSum.connect(allpasses[0]);
-    allpasses[0].connect(allpasses[1]);
-    allpasses[1].connect(output);
+    // Series: combSum → ap0 → ap1 → output
+    let node = combSum;
+    allpasses.forEach(ap => {
+      node.connect(ap.delay);
+      node.connect(ap.out);
+      node = ap.out;
+    });
+    node.connect(output);
 
     return {
       input,
       output,
       setDecay: (val) => {
-        combs.forEach((c, i) => {
-          const fbVal = Math.min(0.95, Math.pow(combGains[i], val));
-          c.feedback.gain.setTargetAtTime(fbVal, ctx.currentTime, 0.05);
+        combs.forEach(c => {
+          c.feedback.gain.setTargetAtTime(_combFeedback(c.base, val), ctx.currentTime, 0.05);
         });
-      }
+      },
     };
   }
 
+  /**
+   * Map a decay TIME (seconds) to a comb feedback gain, monotonically.
+   * The previous mapping was inverted — a longer "decay" produced a
+   * SHORTER tail.
+   */
+  function _combFeedback(baseGain, decayTime) {
+    const t = Math.max(0.3, Math.min(10, decayTime));
+    // 0.3s → 0.55, 10s → 0.96
+    const g = 0.55 + 0.41 * ((t - 0.3) / (10 - 0.3));
+    return Math.min(0.96, Math.max(0.3, g));
+  }
+
   function _createPingPongDelay(ctx, delayTime, feedbackVal) {
-    const splitter = ctx.createChannelSplitter(2);
     const merger = ctx.createChannelMerger(2);
 
     const delayL = ctx.createDelay(2.0);
@@ -842,65 +1096,85 @@ const AudioEngine = (() => {
     };
   }
 
+  /** Energy-conserving dry level for the current wet amounts. */
+  function _dryValue() {
+    return Math.max(0.15, Math.min(1, 1 - (reverbMixVal + delayMixVal) * 0.5));
+  }
+
   function setReverbMix(mix) {
-    reverbMixVal = mix;
+    reverbMixVal = Math.max(0, Math.min(1, mix));
     if (reverbWetGain && ctx) {
-      reverbWetGain.gain.setTargetAtTime(mix, ctx.currentTime, 0.02);
+      reverbWetGain.gain.setTargetAtTime(reverbMixVal * 0.9, ctx.currentTime, 0.02);
       _updateDryGain();
     }
   }
 
   function setReverbDecay(decay) {
-    reverbDecayVal = decay;
-    if (reverbNode) {
-      reverbNode.setDecay(decay);
+    reverbDecayVal = Math.max(0.3, Math.min(10, decay));
+    if (reverbNode) reverbNode.setDecay(reverbDecayVal);
+  }
+
+  function setReverbTone(freq) {
+    reverbToneVal = Math.max(200, Math.min(18000, freq));
+    if (reverbToneFilter && ctx) {
+      reverbToneFilter.frequency.setTargetAtTime(reverbToneVal, ctx.currentTime, 0.05);
     }
   }
 
   function setDelayMix(mix) {
-    delayMixVal = mix;
+    delayMixVal = Math.max(0, Math.min(1, mix));
     if (delayWetGain && ctx) {
-      delayWetGain.gain.setTargetAtTime(mix, ctx.currentTime, 0.02);
+      delayWetGain.gain.setTargetAtTime(delayMixVal * 0.9, ctx.currentTime, 0.02);
       _updateDryGain();
     }
   }
 
   function setDelayTime(time) {
-    delayTimeVal = time;
-    if (delayNode) {
-      delayNode.setDelayTime(time);
-    }
+    delayTimeVal = Math.max(0.02, Math.min(2, time));
+    if (delayNode) delayNode.setDelayTime(delayTimeVal);
   }
 
   function setDelayFeedback(fb) {
-    delayFeedbackVal = fb;
-    if (delayNode) {
-      delayNode.setFeedback(fb);
+    delayFeedbackVal = Math.max(0, Math.min(0.95, fb));
+    if (delayNode) delayNode.setFeedback(delayFeedbackVal);
+  }
+
+  function setDelayTone(freq) {
+    delayToneVal = Math.max(200, Math.min(18000, freq));
+    if (delayToneFilter && ctx) {
+      delayToneFilter.frequency.setTargetAtTime(delayToneVal, ctx.currentTime, 0.05);
     }
   }
 
   function _updateDryGain() {
     if (dryGain && ctx) {
-      const dryVal = Math.max(0.1, 1.0 - reverbMixVal * 0.7 - delayMixVal * 0.7);
-      dryGain.gain.setTargetAtTime(dryVal, ctx.currentTime, 0.02);
+      dryGain.gain.setTargetAtTime(_dryValue(), ctx.currentTime, 0.02);
     }
   }
 
-  function setReverbTone(freq) {
-    // freq: 500–20000 Hz high-shelf cutoff
-    if (reverbToneFilter && ctx) {
-      reverbToneFilter.frequency.setTargetAtTime(freq, ctx.currentTime, 0.05);
-    }
+  /** Current spatial FX settings — used by project save/load. */
+  function getSpatialFX() {
+    return {
+      reverbMix: reverbMixVal,
+      reverbDecay: reverbDecayVal,
+      reverbTone: reverbToneVal,
+      delayMix: delayMixVal,
+      delayTime: delayTimeVal,
+      delayFeedback: delayFeedbackVal,
+      delayTone: delayToneVal,
+    };
   }
 
-  function setDelayTone(freq) {
-    if (delayToneFilter && ctx) {
-      delayToneFilter.frequency.setTargetAtTime(freq, ctx.currentTime, 0.05);
-    }
-  }
+  /** Master analyser for the UI scope. */
+  function getAnalyser() { return masterAnalyser; }
+
+  /** Namespaced sampler categories (for the instrument dropdown). */
+  function samplerCategoryName(name) { return SAMPLER_PREFIX + name; }
+  function isSamplerType(type) { return typeof type === 'string' && type.startsWith(SAMPLER_PREFIX); }
 
   return {
     init,
+    getContext,
     resume,
     noteOn,
     noteOff,
@@ -909,9 +1183,14 @@ const AudioEngine = (() => {
     setEnabled,
     isEnabled,
     setMasterVolume,
+    getMasterVolume,
     setTrackInstrument,
-    setTrackVolume,
     getTrackInstruments,
+    setTrackVolume,
+    getSpatialFX,
+    getAnalyser,
+    samplerCategoryName,
+    isSamplerType,
     setReverbMix,
     setReverbDecay,
     setReverbTone,

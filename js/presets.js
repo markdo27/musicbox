@@ -36,6 +36,8 @@ function emptyTrack(name, midiChannel = 1) {
     muted: false,
     soloed: false,
     volume: 100,
+    audioMode: 'both',
+    midiOutputId: null,
     steps: Array.from({ length: 16 }, () => ({
       active: false,
       note: 60,
@@ -44,6 +46,8 @@ function emptyTrack(name, midiChannel = 1) {
       probability: 100,
       accent: false,
       slide: false,
+      offset: 0,
+      repeats: 1,
     })),
   };
 }
@@ -91,8 +95,8 @@ const PRESETS = {
     icon: '⚡',
     bpm: 135,
     swing: 0,
-    color: '#00d4ff',
-    colorRgb: '0,212,255',
+    color: 'var(--accent-cyan)',
+    colorRgb: '14,116,144',
     description: 'Dark industrial techno — E Phrygian bass, 4/4 kick, driving 8th hats',
     instruments: ['drum', 'drum', 'drum', 'drum', 'bass', 'lead', 'pad', 'drum'],
     spatialFX: {
@@ -181,8 +185,8 @@ const PRESETS = {
     icon: '🧪',
     bpm: 140,
     swing: 0,
-    color: '#00ff88',
-    colorRgb: '0,255,136',
+    color: 'var(--accent-green)',
+    colorRgb: '22,163,74',
     description: 'Authentic acid — TB-303 basslines with accent & slide, 16th hats',
     instruments: ['drum', 'drum', 'drum', 'drum', 'acid', 'acid', 'lead', 'pad'],
     spatialFX: {
@@ -256,7 +260,7 @@ const PRESETS = {
       // Pattern: [ . . x . | . x . x | . . x . | x . . x ]
       // Steps:         2       5   7         10   12      15
       // No slides (not consecutive), accent on downbeat 12
-      setSteps(emptyTrack('Acid 303 B', 1), [
+      setSteps(emptyTrack('Acid 303 B', 2), [
         //  idx  note  vel  gate  prob  accent slide
         [2,  40,  88, 0.35, 100, false, false],  // E2
         [5,  43,  80, 0.25, 100, false, false],  // G2

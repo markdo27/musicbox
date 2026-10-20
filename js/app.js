@@ -21,19 +21,23 @@
     ...t,
     steps: Array.from({ length: 16 }, () => ({
       active: false, note: 60, velocity: 100, gate: 0.5, probability: 100,
-      accent: false, slide: false,
+      accent: false, slide: false, offset: 0, repeats: 1,
     })),
   }));
 
+  // ─── DOM shorthands ──────────────────────────────────────────
+  const $ = (id) => document.getElementById(id);
+  const bpmInput = $('bpm-value');
+  const swingSlider = $('swing-slider');
+  const swingVal = $('swing-value');
 
   // ─── Initialize modules ───────────────────────────────────────
 
   // Sequencer: register callbacks
-  // Update transport clock on every step
   Sequencer.setStepCallback((step) => {
     UI.updatePlayhead(step);
-    // Flash track activity LEDs for active steps
     if (step >= 0) {
+      // Flash track activity LEDs for active steps
       Sequencer.getTracks().forEach((track, i) => {
         const stepData = track.steps[step];
         if (stepData?.active && !track.muted) {
@@ -41,37 +45,28 @@
           if (stepData.note !== undefined) UI.flashKey(stepData.note);
         }
       });
-      // Update bar:beat:step clock
-      const bb = Sequencer.barBeat();
-      const barEl = document.getElementById('clock-bar');
-      const beatEl = document.getElementById('clock-beat');
-      const stepEl = document.getElementById('clock-step');
-      if (barEl) barEl.textContent = bb.bar;
-      if (beatEl) beatEl.textContent = bb.beat;
-      if (stepEl) stepEl.textContent = bb.step;
+      // Update bar:beat:step clock — use the PLAYING step, not the
+      // scheduler's look-ahead step, or the clock reads one step ahead.
+      const bb = Sequencer.barBeat(step);
+      $('clock-bar').textContent = bb.bar;
+      $('clock-beat').textContent = bb.beat;
+      $('clock-step').textContent = bb.step;
     }
   });
 
   Sequencer.setStateCallback((state) => {
     UI.renderSequencer(state);
-    // Sync BPM display
-    document.getElementById('bpm-value').value = state.bpm;
-    // Reset clock if stopped
-    if (!state.isPlaying) {
-      const barEl = document.getElementById('clock-bar');
-      const beatEl = document.getElementById('clock-beat');
-      const stepEl = document.getElementById('clock-step');
-      if (barEl) barEl.textContent = '1';
-      if (beatEl) beatEl.textContent = '1';
-      if (stepEl) stepEl.textContent = '1';
-    }
-    // Keep undo button state in sync
-    const undoBtn = document.getElementById('btn-undo');
-    if (undoBtn) undoBtn.disabled = !Sequencer.canUndo();
+    UI.syncControls(state);
+  });
+
+  // Light updates: BPM, swing, transport, undo/redo availability.
+  // These must NOT re-render the 256 step buttons.
+  Sequencer.setTransportCallback((state) => {
+    UI.syncControls(state);
   });
 
   // MIDI: register monitor element
-  MidiManager.setLogElement(document.getElementById('monitor-log'));
+  MidiManager.setLogElement($('monitor-log'));
 
   // MIDI device change callback → refresh device panel
   MidiManager.setDeviceChangeCallback((devices) => {
@@ -81,9 +76,10 @@
   // MIDI incoming message → record if active
   MidiManager.setMessageCallback((msg) => {
     if (msg.type === 'noteon' && Sequencer.getState().isRecording && Sequencer.isPlaying()) {
-      const step = Sequencer.getCurrentStep();
+      // Use the PLAYING step, otherwise the note lands 1–2 sixteenths
+      // ahead of where it was actually played.
+      const step = Sequencer.getPlayingStep();
       if (step >= 0) {
-        // Record into current step of first unoccupied track on same channel
         const trackIdx = Sequencer.getTracks().findIndex(t => t.midiChannel === msg.channel);
         if (trackIdx >= 0) {
           Sequencer.setStepData(trackIdx, step, {
@@ -91,339 +87,426 @@
             note: msg.note,
             velocity: msg.velocity,
           });
+          UI.refreshStepBtn(trackIdx, step);
         }
       }
     }
   });
 
+  // MIDI activity → flash the matching track
+  MidiManager.setActivityCallback((channel, note) => {
+    const idx = Sequencer.getTracks().findIndex(t => t.midiChannel === channel);
+    if (idx >= 0) UI.flashTrackActivity(idx);
+  });
+
   // ─── Load saved project or init defaults ──────────────────────
   const saved = Storage.load();
   if (saved) {
-    Storage.applyProject(saved);
-    UI.showToast('Project restored', 'success');
+    const ok = Storage.applyProject(saved);
+    if (ok) {
+      UI.showToast('Project restored', 'success');
+    } else {
+      Sequencer.initTracks(DEFAULT_TRACKS);
+      UI.showToast('Saved project could not be read — starting fresh', 'error');
+    }
   } else {
     Sequencer.initTracks(DEFAULT_TRACKS);
+  }
+
+  // On a FIRST run the app would open to a completely empty grid, which
+  // reads as "broken" rather than "blank". Seed it with a playable pattern
+  // so the user lands on something they can immediately hear and edit.
+  if (!saved && window.Generator) {
+    const seed = Generator.randomSeedString();
+    Sequencer.setGenerativeParams(Generator.normaliseParams({ genre: 'techno', seed }));
+    Sequencer.randomizeAll();
   }
 
   // ─── Render UI ────────────────────────────────────────────────
   UI.renderPresets();
   UI.renderKeyboard();
   UI.renderSequencer(Sequencer.getState());
+  UI.syncControls(Sequencer.getState());
+  // The known-hardware cards must ALWAYS be visible (connected or offline).
+  // Previously renderDevices() was only called after a successful MIDI
+  // request, so on a browser without Web MIDI the panel was simply empty.
+  UI.renderDevices(MidiManager.getDeviceList());
 
   // ─── Audio Engine Init ────────────────────────────────────────
-  // AudioEngine lazy-inits on first note; just render the instrument panel now
+  // The AudioContext is created lazily on the first user gesture, so the
+  // autoplay policy is respected. The sampler database is fetched in the
+  // BACKGROUND — awaiting it here used to block every button on the page
+  // when the network was slow.
   if (window.SamplerEngine) {
-    await SamplerEngine.init();
+    SamplerEngine.init().then(() => {
+      UI.renderInstruments();
+    });
   }
   UI.renderInstruments();
+  UI.renderGenerator();
 
   // Audio toggle button
-  const audioToggleBtn = document.getElementById('btn-audio-toggle');
+  const audioToggleBtn = $('btn-audio-toggle');
   audioToggleBtn.addEventListener('click', () => {
     const enabled = !AudioEngine.isEnabled();
     AudioEngine.setEnabled(enabled);
     audioToggleBtn.classList.toggle('active', enabled);
+    audioToggleBtn.setAttribute('aria-pressed', String(enabled));
     audioToggleBtn.querySelector('.audio-toggle-icon').textContent = enabled ? '🔊' : '🔇';
     UI.showToast(enabled ? '🔊 Audio ON' : '🔇 Audio OFF', 'info');
   });
 
   // Master volume slider
-  document.getElementById('master-vol').addEventListener('input', (e) => {
-    AudioEngine.setMasterVolume(parseInt(e.target.value) / 100);
+  $('master-vol').addEventListener('input', (e) => {
+    AudioEngine.setMasterVolume(parseInt(e.target.value, 10) / 100);
   });
 
   // Spatial FX UI bindings
-  document.getElementById('fx-reverb-mix').addEventListener('input', (e) => {
-    const val = parseInt(e.target.value);
-    document.getElementById('fx-reverb-mix-val').textContent = val + '%';
+  $('fx-reverb-mix').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value, 10);
+    $('fx-reverb-mix-val').textContent = val + '%';
     AudioEngine.setReverbMix(val / 100);
   });
 
-  document.getElementById('fx-reverb-decay').addEventListener('input', (e) => {
-    const val = parseInt(e.target.value) / 10;
-    document.getElementById('fx-reverb-decay-val').textContent = val.toFixed(1) + 's';
+  $('fx-reverb-decay').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value, 10) / 10;
+    $('fx-reverb-decay-val').textContent = val.toFixed(1) + 's';
     AudioEngine.setReverbDecay(val);
   });
 
-  document.getElementById('fx-reverb-tone').addEventListener('input', (e) => {
-    const val = parseInt(e.target.value);
-    const kHz = (val / 1000).toFixed(1);
-    document.getElementById('fx-reverb-tone-val').textContent = kHz + 'k';
+  $('fx-reverb-tone').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value, 10);
+    $('fx-reverb-tone-val').textContent = (val / 1000).toFixed(1) + 'k';
     AudioEngine.setReverbTone(val);
   });
 
-  document.getElementById('fx-delay-mix').addEventListener('input', (e) => {
-    const val = parseInt(e.target.value);
-    document.getElementById('fx-delay-mix-val').textContent = val + '%';
+  $('fx-delay-mix').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value, 10);
+    $('fx-delay-mix-val').textContent = val + '%';
     AudioEngine.setDelayMix(val / 100);
   });
 
-  document.getElementById('fx-delay-time').addEventListener('change', (e) => {
-    const val = parseFloat(e.target.value);
-    AudioEngine.setDelayTime(val);
+  $('fx-delay-time').addEventListener('change', (e) => {
+    AudioEngine.setDelayTime(parseFloat(e.target.value));
   });
 
-  document.getElementById('fx-delay-feedback').addEventListener('input', (e) => {
-    const val = parseInt(e.target.value);
-    document.getElementById('fx-delay-feedback-val').textContent = val + '%';
+  $('fx-delay-feedback').addEventListener('input', (e) => {
+    const val = parseInt(e.target.value, 10);
+    $('fx-delay-feedback-val').textContent = val + '%';
     AudioEngine.setDelayFeedback(val / 100);
   });
 
-
-  document.getElementById('btn-play').addEventListener('click', () => {
+  // ─── Transport ────────────────────────────────────────────────
+  $('btn-play').addEventListener('click', () => {
     if (Sequencer.isPlaying()) {
       Sequencer.stop();
-      document.getElementById('btn-play').classList.remove('active');
-      document.getElementById('btn-play').textContent = '▶';
     } else {
+      // The AudioContext must exist and be running before the transport starts.
+      AudioEngine.init();
+      AudioEngine.resume();
       Sequencer.play();
-      document.getElementById('btn-play').classList.add('active');
-      document.getElementById('btn-play').textContent = '⏸';
+      // Tell the hardware which patch each track should play.
+      MidiManager.sendProgramChanges(Sequencer.getTracks());
     }
+    UI.syncControls(Sequencer.getState());
   });
 
-  document.getElementById('btn-stop').addEventListener('click', () => {
+  $('btn-stop').addEventListener('click', () => {
     Sequencer.stop();
-    document.getElementById('btn-play').classList.remove('active');
-    document.getElementById('btn-play').textContent = '▶';
+    UI.syncControls(Sequencer.getState());
   });
 
-  document.getElementById('btn-rewind').addEventListener('click', () => {
+  $('btn-rewind').addEventListener('click', () => {
     Sequencer.rewind();
+    UI.syncControls(Sequencer.getState());
   });
 
-  document.getElementById('btn-record').addEventListener('click', () => {
+  $('btn-record').addEventListener('click', () => {
     Sequencer.toggleRecord();
-    document.getElementById('btn-record').classList.toggle('active', Sequencer.getState().isRecording);
+    UI.syncControls(Sequencer.getState());
   });
 
   // ─── BPM Control ─────────────────────────────────────────────
-  const bpmInput = document.getElementById('bpm-value');
   bpmInput.addEventListener('change', () => {
     Sequencer.setBpm(parseInt(bpmInput.value, 10));
+    UI.syncControls(Sequencer.getState());
   });
   bpmInput.addEventListener('wheel', (e) => {
     e.preventDefault();
     const delta = e.deltaY < 0 ? 1 : -1;
     Sequencer.setBpm(Sequencer.getState().bpm + delta);
-    bpmInput.value = Sequencer.getState().bpm;
+    UI.syncControls(Sequencer.getState());
   }, { passive: false });
 
-  document.getElementById('bpm-up').addEventListener('click', () => {
+  $('bpm-up').addEventListener('click', () => {
     Sequencer.setBpm(Sequencer.getState().bpm + 1);
-    bpmInput.value = Sequencer.getState().bpm;
-  });
-  document.getElementById('bpm-down').addEventListener('click', () => {
-    Sequencer.setBpm(Sequencer.getState().bpm - 1);
-    bpmInput.value = Sequencer.getState().bpm;
+    UI.syncControls(Sequencer.getState());
   });
 
-  document.getElementById('btn-tap').addEventListener('click', () => {
+  $('bpm-down').addEventListener('click', () => {
+    Sequencer.setBpm(Sequencer.getState().bpm - 1);
+    UI.syncControls(Sequencer.getState());
+  });
+
+  $('btn-tap').addEventListener('click', () => {
     Sequencer.tap();
-    bpmInput.value = Sequencer.getState().bpm;
+    UI.syncControls(Sequencer.getState());
   });
 
   // ─── Swing Control ────────────────────────────────────────────
-  const swingSlider = document.getElementById('swing-slider');
-  const swingVal = document.getElementById('swing-value');
   swingSlider.addEventListener('input', () => {
-    const v = parseInt(swingSlider.value);
+    const v = parseInt(swingSlider.value, 10);
     Sequencer.setSwing(v);
     swingVal.textContent = v + '%';
   });
 
   // ─── Step Count ───────────────────────────────────────────────
-  document.getElementById('step-count').addEventListener('change', (e) => {
-    Sequencer.setStepCount(parseInt(e.target.value));
+  $('step-count').addEventListener('change', (e) => {
+    Sequencer.setStepCount(parseInt(e.target.value, 10));
+    UI.syncControls(Sequencer.getState());
   });
 
   // ─── MIDI Connect ─────────────────────────────────────────────
-  document.getElementById('btn-request-midi').addEventListener('click', async () => {
+  $('btn-request-midi').addEventListener('click', async () => {
     const ok = await MidiManager.requestAccess();
     if (ok) {
+      MidiManager.restoreSelectedOutput();
       UI.renderDevices(MidiManager.getDeviceList());
       UI.showToast('MIDI connected!', 'success');
     } else {
-      UI.showToast('MIDI access denied. Use Chrome/Edge.', 'error');
+      UI.showToast('MIDI access denied. Use Chrome/Edge over http:// or https://.', 'error');
     }
   });
 
-  // Try auto-connect MIDI on load
+  // Reconnect silently if the browser has already granted MIDI access.
+  // Chrome 124+ prompts for ALL Web MIDI use, so an unsolicited prompt on
+  // page load gets ignored — only auto-connect when permission exists.
   (async () => {
-    if (navigator.requestMIDIAccess) {
-      const ok = await MidiManager.requestAccess().catch(() => false);
-      if (ok) UI.renderDevices(MidiManager.getDeviceList());
+    if (!navigator.requestMIDIAccess) return;
+    try {
+      if (navigator.permissions && navigator.permissions.query) {
+        const status = await navigator.permissions.query({ name: 'midi' });
+        if (status.state !== 'granted') return;
+      }
+    } catch (e) {
+      // Permissions API does not know about 'midi' in some browsers —
+      // fall through and try anyway.
+    }
+    const ok = await MidiManager.requestAccess().catch(() => false);
+    if (ok) {
+      MidiManager.restoreSelectedOutput();
+      UI.renderDevices(MidiManager.getDeviceList());
     }
   })();
 
   // ─── MIDI Monitor Clear ───────────────────────────────────────
-  document.getElementById('btn-clear-monitor').addEventListener('click', () => {
+  $('btn-clear-monitor').addEventListener('click', () => {
     MidiManager.clearLog();
   });
 
   // ─── Preset Randomize ─────────────────────────────────────────
-  document.getElementById('btn-randomize').addEventListener('click', () => {
-    Sequencer.randomizeAll();
-    UI.renderSequencer(Sequencer.getState());
+  $('btn-randomize').addEventListener('click', () => {
+    if (window.Generator) {
+      // Generate from the panel's current parameters.
+      UI.renderGenerator();
+      const genBtn = $('gen-generate');
+      if (genBtn) genBtn.click();
+    } else {
+      Sequencer.randomizeAll();
+      UI.renderSequencer(Sequencer.getState());
+    }
     document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
-    UI.showToast('Randomized all tracks!', 'info');
-    document.getElementById('btn-undo').disabled = !Sequencer.canUndo();
+    UI.showToast('Generated a new pattern', 'info');
+    UI.syncControls(Sequencer.getState());
   });
 
-  document.getElementById('btn-clear-all').addEventListener('click', () => {
+  $('btn-clear-all').addEventListener('click', () => {
     Sequencer.clearAllTracks();
     UI.renderSequencer(Sequencer.getState());
     document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
     UI.showToast('All tracks cleared', 'info');
-    document.getElementById('btn-undo').disabled = !Sequencer.canUndo();
+    UI.syncControls(Sequencer.getState());
   });
 
   // ─── Save / Load / Export ─────────────────────────────────────
-  document.getElementById('btn-save').addEventListener('click', () => {
+  $('btn-save').addEventListener('click', () => {
     const ok = Storage.save();
     UI.showToast(ok ? '💾 Project saved!' : 'Save failed', ok ? 'success' : 'error');
   });
 
-  document.getElementById('btn-load').addEventListener('click', () => {
-    document.getElementById('file-load-input').click();
+  $('btn-load').addEventListener('click', () => {
+    $('file-load-input').click();
   });
 
-  document.getElementById('file-load-input').addEventListener('change', (e) => {
+  $('file-load-input').addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    Storage.importJson(file, (err, project) => {
+    Storage.importJson(file, (err) => {
       if (err) {
-        UI.showToast('Load failed: invalid file', 'error');
+        UI.showToast('Load failed: ' + (err.message || 'invalid file'), 'error');
       } else {
         UI.renderSequencer(Sequencer.getState());
-        bpmInput.value = Sequencer.getState().bpm;
-        swingSlider.value = Sequencer.getState().swing;
-        swingVal.textContent = Sequencer.getState().swing + '%';
+        UI.renderInstruments();
+        UI.renderGenerator();
+        UI.syncControls(Sequencer.getState());
         UI.showToast('Project loaded!', 'success');
       }
     });
     e.target.value = '';
   });
 
-  document.getElementById('btn-export-midi').addEventListener('click', () => {
+  $('btn-export-json').addEventListener('click', () => {
+    Storage.exportJson();
+    UI.showToast('Project exported as .json', 'success');
+  });
+
+  $('btn-export-midi').addEventListener('click', () => {
     Storage.exportMidi();
     UI.showToast('MIDI file exported!', 'success');
   });
 
   // ─── Note Picker Modal ────────────────────────────────────────
-  document.getElementById('sp-velocity').addEventListener('input', (e) => {
-    document.getElementById('sp-velocity-val').textContent = e.target.value;
+  $('sp-velocity').addEventListener('input', (e) => {
+    $('sp-velocity-val').textContent = e.target.value;
   });
-  document.getElementById('sp-probability').addEventListener('input', (e) => {
-    document.getElementById('sp-probability-val').textContent = e.target.value + '%';
+  $('sp-probability').addEventListener('input', (e) => {
+    $('sp-probability-val').textContent = e.target.value + '%';
   });
 
-  document.getElementById('sp-confirm').addEventListener('click', () => {
-    // Commit all picker values to sequencer
+  $('sp-confirm').addEventListener('click', () => {
     const editing = UI.getCurrentStepEditing();
     if (editing) {
       const { trackIdx, stepIdx } = editing;
-      const octave = parseInt(document.getElementById('sp-octave')?.value || '4');
+      const octave = parseInt($('sp-octave')?.value || '4', 10);
       const noteInOctave = UI.getSelectedNoteInPicker();
       const note = (octave + 1) * 12 + noteInOctave;
-      const velocity = parseInt(document.getElementById('sp-velocity').value);
-      const gate = parseFloat(document.getElementById('sp-gate').value);
-      const probability = parseInt(document.getElementById('sp-probability').value);
+      const velocity = parseInt($('sp-velocity').value, 10);
+      const gate = parseFloat($('sp-gate').value);
+      const probability = parseInt($('sp-probability').value, 10);
       Sequencer.setStepData(trackIdx, stepIdx, { note, velocity, gate, probability });
     }
     UI.closeNotePicker();
   });
 
-  document.getElementById('sp-cancel').addEventListener('click', () => {
+  $('sp-cancel').addEventListener('click', () => {
     UI.closeNotePicker();
   });
 
-  // Close modal on overlay click
-  document.getElementById('modal-note-picker').addEventListener('click', (e) => {
+  $('modal-note-picker').addEventListener('click', (e) => {
     if (e.target === e.currentTarget) UI.closeNotePicker();
   });
 
-  // ─── Keyboard shortcuts ────────────────────────────────────────
+  // ─── Keyboard shortcuts ───────────────────────────────────────
   document.addEventListener('keydown', (e) => {
-    // Don't intercept when typing in inputs
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.contentEditable === 'true') return;
+    // Don't intercept when typing in inputs or when a button has focus
+    // (Space would otherwise activate the button AND toggle playback).
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' ||
+        e.target.contentEditable === 'true') return;
 
     switch (e.code) {
       case 'Space':
+        if (tag === 'BUTTON') return;
         e.preventDefault();
-        document.getElementById('btn-play').click();
+        $('btn-play').click();
         break;
       case 'Escape':
         Sequencer.stop();
-        document.getElementById('btn-play').classList.remove('active');
-        document.getElementById('btn-play').textContent = '▶';
+        UI.syncControls(Sequencer.getState());
         // Close any open modals
-        document.getElementById('modal-shortcuts').hidden = true;
-        document.getElementById('modal-about').hidden = true;
+        $('modal-shortcuts').hidden = true;
+        $('modal-about').hidden = true;
+        $('modal-note-picker').hidden = true;
         break;
       case 'KeyR':
-        if (e.ctrlKey || e.metaKey) { e.preventDefault(); document.getElementById('btn-record').click(); }
-        break;
-      case 'KeyS':
-        if (e.ctrlKey || e.metaKey) { e.preventDefault(); document.getElementById('btn-save').click(); }
-        break;
-      case 'KeyZ':
-        if (e.ctrlKey || e.metaKey) { e.preventDefault(); document.getElementById('btn-undo').click(); }
-        break;
-      case 'Slash': // ? key (with shift)
-        if (e.shiftKey) {
+        if (e.ctrlKey || e.metaKey) {
           e.preventDefault();
-          const modal = document.getElementById('modal-shortcuts');
-          modal.hidden = !modal.hidden;
+          $('btn-record').click();
+        } else {
+          // New random seed in the generator
+          e.preventDefault();
+          const reroll = $('gen-reroll');
+          if (reroll) reroll.click();
         }
         break;
+      case 'KeyS':
+        if (e.ctrlKey || e.metaKey) { e.preventDefault(); $('btn-save').click(); }
+        break;
+      case 'KeyZ':
+        if (e.ctrlKey || e.metaKey) {
+          e.preventDefault();
+          if (e.shiftKey) $('btn-redo').click();
+          else $('btn-undo').click();
+        }
+        break;
+      case 'KeyG':
+        if (!e.ctrlKey && !e.metaKey) {
+          e.preventDefault();
+          const genBtn = $('gen-generate');
+          if (genBtn) genBtn.click();
+        }
+        break;
+      default:
+        // "?" — layout independent (e.code === 'Slash' only works on US/UK).
+        if (e.key === '?') {
+          e.preventDefault();
+          const modal = $('modal-shortcuts');
+          modal.hidden = !modal.hidden;
+        }
     }
   });
 
-  // ─── Undo ──────────────────────────────────────────────────────
-  document.getElementById('btn-undo').addEventListener('click', () => {
-    const ok = Sequencer.undo();
-    if (ok) {
+  // ─── Undo / Redo ──────────────────────────────────────────────
+  $('btn-undo').addEventListener('click', () => {
+    if (Sequencer.undo()) {
       UI.renderSequencer(Sequencer.getState());
-      const state = Sequencer.getState();
-      bpmInput.value = state.bpm;
-      swingSlider.value = state.swing;
-      swingVal.textContent = state.swing + '%';
-      UI.showToast('↩ Undo!', 'info');
+      UI.renderInstruments();
+      UI.renderGenerator();
+      UI.showToast('↩ Undo', 'info');
     }
-    document.getElementById('btn-undo').disabled = !Sequencer.canUndo();
+    UI.syncControls(Sequencer.getState());
+  });
+
+  $('btn-redo').addEventListener('click', () => {
+    if (Sequencer.redo()) {
+      UI.renderSequencer(Sequencer.getState());
+      UI.renderInstruments();
+      UI.renderGenerator();
+      UI.showToast('↪ Redo', 'info');
+    }
+    UI.syncControls(Sequencer.getState());
   });
 
   // ─── Keyboard Shortcuts Modal ─────────────────────────────────
-  document.getElementById('btn-help').addEventListener('click', () => {
-    document.getElementById('modal-shortcuts').hidden = false;
+  $('btn-help').addEventListener('click', () => {
+    $('modal-shortcuts').hidden = false;
   });
-  document.getElementById('shortcuts-close').addEventListener('click', () => {
-    document.getElementById('modal-shortcuts').hidden = true;
+  $('shortcuts-close').addEventListener('click', () => {
+    $('modal-shortcuts').hidden = true;
   });
-  document.getElementById('modal-shortcuts').addEventListener('click', (e) => {
+  $('modal-shortcuts').addEventListener('click', (e) => {
     if (e.target === e.currentTarget) e.currentTarget.hidden = true;
   });
 
   // ─── About & Licence Modal ────────────────────────────────────
-  document.getElementById('btn-about').addEventListener('click', () => {
-    document.getElementById('modal-about').hidden = false;
+  $('btn-about').addEventListener('click', () => {
+    $('modal-about').hidden = false;
   });
-  document.getElementById('about-close').addEventListener('click', () => {
-    document.getElementById('modal-about').hidden = true;
+  $('about-close').addEventListener('click', () => {
+    $('modal-about').hidden = true;
   });
-  document.getElementById('modal-about').addEventListener('click', (e) => {
+  $('modal-about').addEventListener('click', (e) => {
     if (e.target === e.currentTarget) e.currentTarget.hidden = true;
   });
 
-  // ─── Save Slots ────────────────────────────────────────────────
+  // ─── Save Slots ───────────────────────────────────────────────
   let _pendingSlotId = null;
-  const slotMenu = document.getElementById('slot-menu');
+  const slotMenu = $('slot-menu');
 
   function _updateSlotButtons() {
     const meta = Storage.getSlotMeta();
     meta.forEach(slot => {
-      const btn = document.getElementById(`slot-btn-${slot.id}`);
+      const btn = $(`slot-btn-${slot.id}`);
       if (!btn) return;
       btn.classList.toggle('filled', !slot.empty);
       if (!slot.empty) {
@@ -438,7 +521,6 @@
   document.querySelectorAll('.slot-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       _pendingSlotId = btn.dataset.slot;
-      // Show context menu near button
       const rect = btn.getBoundingClientRect();
       slotMenu.style.top = (rect.bottom + 8) + 'px';
       slotMenu.style.left = rect.left + 'px';
@@ -446,7 +528,7 @@
     });
   });
 
-  document.getElementById('slot-menu-save').addEventListener('click', () => {
+  $('slot-menu-save').addEventListener('click', () => {
     if (!_pendingSlotId) return;
     const ok = Storage.saveSlot(_pendingSlotId);
     UI.showToast(ok ? `Saved to Slot ${_pendingSlotId}` : 'Save failed', ok ? 'success' : 'error');
@@ -454,41 +536,86 @@
     slotMenu.hidden = true;
   });
 
-  document.getElementById('slot-menu-load').addEventListener('click', () => {
+  $('slot-menu-load').addEventListener('click', () => {
     if (!_pendingSlotId) return;
     Sequencer.saveUndo();
     const ok = Storage.loadSlot(_pendingSlotId);
     if (ok) {
       UI.renderSequencer(Sequencer.getState());
-      bpmInput.value = Sequencer.getState().bpm;
-      swingSlider.value = Sequencer.getState().swing;
-      swingVal.textContent = Sequencer.getState().swing + '%';
       UI.renderInstruments();
+      UI.renderGenerator();
+      UI.syncControls(Sequencer.getState());
       UI.showToast(`Loaded Slot ${_pendingSlotId}`, 'success');
     } else {
       UI.showToast(`Slot ${_pendingSlotId} is empty`, 'error');
     }
-    document.getElementById('btn-undo').disabled = !Sequencer.canUndo();
     slotMenu.hidden = true;
   });
 
-  document.getElementById('slot-menu-cancel').addEventListener('click', () => {
+  $('slot-menu-cancel').addEventListener('click', () => {
     slotMenu.hidden = true;
   });
 
-  // Close slot menu on outside click
   document.addEventListener('click', (e) => {
     if (!slotMenu.hidden && !slotMenu.contains(e.target) && !e.target.classList.contains('slot-btn')) {
       slotMenu.hidden = true;
     }
   });
 
-  // Init slot button states
   _updateSlotButtons();
 
-  // ─── Auto-save ────────────────────────────────────────────────
-  Storage.startAutoSave();
+  // ─── Seed from the URL hash (shareable results) ───────────────
+  (function applyUrlSeed() {
+    if (!location.hash) return;
+    const params = new URLSearchParams(location.hash.replace(/^#/, ''));
+    const seed = params.get('seed');
+    if (!seed) return;
+    const gen = window.Generator;
+    if (!gen) return;
+    const patch = {
+      seed,
+      genre: params.get('genre') || undefined,
+      root: params.get('root') ? parseInt(params.get('root'), 10) : undefined,
+      scale: params.get('scale') || undefined,
+    };
+    const opts = gen.normaliseParams(patch);
+    Sequencer.setGenerativeParams(opts);
+    Sequencer.randomizeAll();
+    UI.renderSequencer(Sequencer.getState());
+    UI.renderGenerator();
+    UI.syncControls(Sequencer.getState());
+    UI.showToast(`Loaded shared seed ${seed}`, 'success');
+  })();
 
-  console.log('🎛️ MusicBox initialized. Space=Play/Pause, Esc=Stop, Ctrl+S=Save');
+  // ─── Master level meter (real, from an AnalyserNode) ──────────
+  (function masterMeter() {
+    const fill = $('master-meter-fill');
+    if (!fill) return;
+    const data = new Uint8Array(512);
+    function tick() {
+      const analyser = AudioEngine.getAnalyser();
+      if (analyser) {
+        analyser.getByteTimeDomainData(data);
+        let peak = 0;
+        for (let i = 0; i < data.length; i++) {
+          const v = Math.abs(data[i] - 128) / 128;
+          if (v > peak) peak = v;
+        }
+        fill.style.width = Math.min(100, Math.round(peak * 118)) + '%';
+      }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  })();
+
+  // ─── Auto-save + unload save ──────────────────────────────────
+  Storage.startAutoSave(30000);
+
+  window.addEventListener('beforeunload', () => {
+    // The autosave has its own key, so this is a safe belt-and-braces copy.
+    Storage.autoSave();
+  });
+
+  console.log('🎛️ MusicBox v2 initialized. Space=Play/Pause, Esc=Stop, Ctrl+S=Save, G=Generate');
 
 })();

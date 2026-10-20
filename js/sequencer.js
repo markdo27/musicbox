@@ -1,8 +1,20 @@
 /**
  * sequencer.js — Step Sequencer Engine
- * Uses AudioContext + precise scheduling for jitter-free timing.
- * Supports 8 tracks × 16/32 steps, per-step probability,
- * velocity, gate, swing, and MIDI output.
+ * ---------------------------------------------------------------------------
+ * Uses the shared AudioContext for precise scheduling.
+ * Supports 8 tracks × 16/32 steps, per-step probability, velocity, gate,
+ * swing, micro-timing, ratchet, accent, slide, and MIDI output.
+ *
+ * KEY FIXES (post-audit):
+ *  - Notes are scheduled at ABSOLUTE AudioContext times, not via setTimeout
+ *    (which was 10–50 ms of jitter — up to 44 % of a 16th note).
+ *  - Swing uses the correct formula: T(k) = T0 + k·S + (k odd ? S·swing : 0).
+ *    The old formula applied REVERSE swing AND lengthened the bar by up to
+ *    25 %, so the sequencer played at a different tempo than its BPM.
+ *  - The UI playhead / clock / MIDI recorder use the PLAYING step, not the
+ *    scheduler's look-ahead step (they were one step apart 50 % of the time).
+ *  - Solo is orthogonal to mute; muting a track no longer kills the whole rig.
+ *  - Undo covers every mutation, and there is a redo stack.
  */
 
 const Sequencer = (() => {
@@ -12,64 +24,103 @@ const Sequencer = (() => {
     bpm: 132,
     swing: 0,         // 0–100
     stepCount: 16,    // 16 or 32
-    currentStep: -1,
+    currentStep: -1,  // look-ahead step (scheduler position)
+    playingStep: -1,  // the step that is actually sounding
     isPlaying: false,
     isRecording: false,
     tracks: [],
+    generative: null, // generator parameters (see Generator.normaliseParams)
   };
 
   // Timing
-  let audioCtx = null;
   let nextNoteTime = 0;
-  let lookAhead = 0.1;       // seconds to schedule ahead
+  let playStartTime = 0;   // AudioContext time of step 0
+  let absStep = 0;         // absolute step counter since play()
+  let lookAhead = 0.12;    // seconds to schedule ahead
   let scheduleInterval = 25; // ms between scheduler runs
   let schedulerTimer = null;
 
   // Callbacks
-  let onStepChange = null;   // fn(step) → UI update
-  let onStateChange = null;  // fn(state) → full UI refresh
+  let onStepChange = null;    // fn(step) → UI update
+  let onStateChange = null;   // fn(state) → FULL UI refresh (structure changed)
+  let onTransportChange = null; // fn(state) → LIGHT UI update (BPM, transport)
 
-  // Note-off tracking
-  const pendingNoteOffs = []; // [{time, channel, note, outputId}]
+  // MIDI notes still held per channel (for legato / slide)
+  const heldMidiNotes = new Map(); // channel → note
 
-  // Undo history (max 20 snapshots)
+  // ─── Undo / Redo history ────────────────────────────────────
   const undoStack = [];
-  const UNDO_MAX = 20;
+  const redoStack = [];
+  const UNDO_MAX = 60;
+
+  /**
+   * Notify the UI. `full` re-renders the whole grid; light only syncs
+   * the transport controls. BPM and swing changes are LIGHT — re-rendering
+   * 256 step buttons on every slider pixel is what made the old app stutter.
+   */
+  function _notify(full) {
+    if (full) { if (onStateChange) onStateChange({ ...state }); }
+    else { if (onTransportChange) onTransportChange({ ...state }); }
+  }
 
   function _deepCloneState() {
     return {
       bpm: state.bpm,
       swing: state.swing,
       stepCount: state.stepCount,
+      generative: state.generative ? JSON.parse(JSON.stringify(state.generative)) : null,
       tracks: state.tracks.map(t => ({
         ...t,
         steps: t.steps.map(s => ({ ...s }))
-      }))
+      })),
+      instruments: window.AudioEngine
+        ? AudioEngine.getTrackInstruments().map(i => i.type)
+        : [],
     };
   }
 
   function saveUndo() {
     undoStack.push(_deepCloneState());
     if (undoStack.length > UNDO_MAX) undoStack.shift();
+    redoStack.length = 0;
+  }
+
+  function _restoreSnapshot(snapshot) {
+    state.bpm = snapshot.bpm;
+    state.swing = snapshot.swing;
+    state.stepCount = snapshot.stepCount;
+    state.generative = snapshot.generative;
+    state.tracks = snapshot.tracks;
+    if (snapshot.instruments && window.AudioEngine) {
+      snapshot.instruments.forEach((type, idx) => AudioEngine.setTrackInstrument(idx, type));
+    }
   }
 
   function undo() {
     if (undoStack.length === 0) return false;
     const snapshot = undoStack.pop();
-    state.bpm = snapshot.bpm;
-    state.swing = snapshot.swing;
-    state.stepCount = snapshot.stepCount;
-    state.tracks = snapshot.tracks;
-    if (onStateChange) onStateChange({ ...state });
+    redoStack.push(_deepCloneState());
+    _restoreSnapshot(snapshot);
+    _notify(true);
     return true;
   }
 
-  // ─── Init AudioContext ───────────────────────────────────────
-  function _ensureAudioCtx() {
-    if (!audioCtx) {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  function redo() {
+    if (redoStack.length === 0) return false;
+    const snapshot = redoStack.pop();
+    undoStack.push(_deepCloneState());
+    _restoreSnapshot(snapshot);
+    _notify(true);
+    return true;
+  }
+
+  // ─── AudioContext ───────────────────────────────────────────
+  function _ctx() {
+    if (window.AudioEngine) {
+      const c = AudioEngine.getContext();
+      if (c) return c;
     }
-    if (audioCtx.state === 'suspended') audioCtx.resume();
+    return null;
   }
 
   // ─── Timing ──────────────────────────────────────────────────
@@ -79,127 +130,161 @@ const Sequencer = (() => {
     return secondsPerBeat / 4;
   }
 
-  function _applySwing(step) {
-    // Odd steps get pushed forward by swing amount
-    if (step % 2 === 1 && state.swing > 0) {
-      const swingOffset = (_secondsPerStep() * state.swing) / 200;
-      return swingOffset;
-    }
-    return 0;
+  /**
+   * Swing offset for an absolute step index.
+   * The formula is the offset FROM the straight grid, so the bar length
+   * stays exactly 16 steps no matter how much swing is applied.
+   */
+  function _swingOffset(absIndex) {
+    if (state.swing <= 0) return 0;
+    if (absIndex % 2 === 0) return 0;
+    return _secondsPerStep() * (state.swing / 100);
+  }
+
+  /** Absolute AudioContext time of an absolute step index. */
+  function _timeOfStep(absIndex) {
+    return playStartTime + absIndex * _secondsPerStep() + _swingOffset(absIndex);
   }
 
   // ─── Scheduler ───────────────────────────────────────────────
   function _scheduler() {
-    const lookAheadTime = audioCtx.currentTime + lookAhead;
+    const ctx = _ctx();
+    if (!ctx) return;
+    const lookAheadTime = ctx.currentTime + lookAhead;
 
-    while (nextNoteTime < lookAheadTime) {
-      _scheduleStep(state.currentStep + 1, nextNoteTime);
-      _advanceStep();
+    // Guard: if a long stall (background tab, GC) left us behind, resync
+    // instead of firing every missed step as a machine-gun burst.
+    if (nextNoteTime < ctx.currentTime - 0.05) {
+      nextNoteTime = ctx.currentTime + 0.02;
     }
 
-    // Process pending note-offs
-    _processPendingNoteOffs();
+    while (nextNoteTime < lookAheadTime) {
+      _scheduleStep(state.currentStep + 1, nextNoteTime, absStep + 1);
+      _advanceStep();
+    }
   }
 
   function _advanceStep() {
-    const spStep = _secondsPerStep();
-    const nextStep = (state.currentStep + 1) % state.stepCount;
-    const swing = _applySwing(nextStep);
-    nextNoteTime += spStep + swing;
-    state.currentStep = nextStep;
+    state.currentStep = (state.currentStep + 1) % state.stepCount;
+    absStep++;
+    nextNoteTime = _timeOfStep(absStep);
   }
 
-  function _scheduleStep(rawStep, time) {
+  /** Is this track audible right now (mute + solo logic)? */
+  function _shouldPlay(track) {
+    if (track.muted) return false;
+    const anySoloed = state.tracks.some(t => t.soloed);
+    if (anySoloed && !track.soloed) return false;
+    return true;
+  }
+
+  function _scheduleStep(rawStep, time, absIndex) {
+    const ctx = _ctx();
+    if (!ctx) return;
     const step = ((rawStep % state.stepCount) + state.stepCount) % state.stepCount;
 
     // Notify UI of playhead position
-    const uiDelay = Math.max(0, (time - audioCtx.currentTime) * 1000);
+    const uiDelay = Math.max(0, (time - ctx.currentTime) * 1000);
     setTimeout(() => {
+      // The PLAYING step is what the user sees and hears — the scheduler's
+      // `currentStep` is one or two steps ahead (look-ahead).
+      state.playingStep = step;
       if (onStepChange) onStepChange(step);
     }, uiDelay);
 
     // Schedule MIDI + Internal Audio for all tracks
     state.tracks.forEach((track, trackIdx) => {
-      if (track.muted) return;
+      if (!_shouldPlay(track)) return;
       const stepData = track.steps[step];
       if (!stepData || !stepData.active) return;
 
       // Probability check
       if (stepData.probability < 100 && Math.random() * 100 > stepData.probability) return;
 
-      // Velocity scale by track volume
-      const scaledVel = Math.round(stepData.velocity * (track.volume / 100));
-      const vel = Math.max(1, Math.min(127, scaledVel));
+      // Internal audio velocity is NOT scaled by track volume — the mixer
+      // gain node owns that. MIDI velocity IS scaled (hardware has no gain).
+      const vel = Math.max(1, Math.min(127, stepData.velocity));
+      const midiVel = Math.max(1, Math.min(127,
+        Math.round(stepData.velocity * (track.volume / 100))));
 
       // Step flags
       const accent = stepData.accent || false;
       const slide  = stepData.slide  || false;
       const audioMode = track.audioMode || 'both';
+      const outputId = track.midiOutputId || null;
 
-      // MIDI: accent boosts velocity to ≥ 100 (triggers TD-3 accent LED)
-      const midiVel = accent ? Math.max(vel, 100) : vel;
+      // Humanised micro-timing
+      const when = time + (stepData.offset || 0) / 1000;
 
-      const noteOnDelay    = Math.max(0, (time - audioCtx.currentTime) * 1000);
-      const noteDurationMs  = _secondsPerStep() * stepData.gate * 1000;
       const noteDurationSec = _secondsPerStep() * stepData.gate;
+      const noteDurationMs  = noteDurationSec * 1000;
+      const repeats = Math.max(1, stepData.repeats || 1);
 
       const ch   = track.midiChannel || 1;
       const note = stepData.note;
 
-      setTimeout(() => {
-        if (!state.isPlaying) return;
-
-        // ── MIDI output ─────────────────────────────────────────
-        if (audioMode !== 'internal') {
-          // Slide: send note-on BEFORE note-off of previous note (triggers HW slide)
-          // (Note-off is scheduled AFTER this note-on by design — see below)
-          MidiManager.noteOn(ch, note, midiVel);
+      // ── MIDI output ─────────────────────────────────────────
+      if (audioMode !== 'internal') {
+        // Legato: release any note still held on this channel first.
+        const held = heldMidiNotes.get(ch);
+        if (held !== undefined) {
+          MidiManager.noteOff(ch, held, outputId);
+          heldMidiNotes.delete(ch);
         }
-
-        // ── Internal audio ──────────────────────────────────────
-        if (audioMode !== 'midi' && window.AudioEngine) {
-          AudioEngine.triggerNote(trackIdx, ch, note, vel, noteDurationSec, accent, slide);
+        MidiManager.noteOn(ch, note, midiVel, outputId);
+        if (slide) {
+          // A slide step keeps the note held until the next note arrives,
+          // which is what triggers the hardware's glide circuit.
+          heldMidiNotes.set(ch, note);
+        } else {
+          _scheduleMidiNoteOff(ch, note, when + noteDurationSec, outputId);
         }
+      }
 
-      }, noteOnDelay);
-
-      setTimeout(() => {
-        if (!state.isPlaying) return;
-        // For slide steps: don't send MIDI note-off (hardware keeps sliding)
-        // The next note-on will re-trigger or continue the slide
-        if (audioMode !== 'internal' && !slide) {
-          MidiManager.noteOff(ch, note);
+      // ── Internal audio ──────────────────────────────────────
+      if (audioMode !== 'midi' && window.AudioEngine) {
+        if (repeats > 1) {
+          // Ratchet: split the step into `repeats` evenly spaced hits.
+          const slice = noteDurationSec / repeats;
+          for (let r = 0; r < repeats; r++) {
+            const rWhen = when + r * slice;
+            AudioEngine.triggerNote(trackIdx, ch, note, vel, slice * 0.9, accent, slide, rWhen);
+          }
+        } else {
+          AudioEngine.triggerNote(trackIdx, ch, note, vel, noteDurationSec, accent, slide, when);
         }
-        // Audio engine self-manages note-off for drums + acid; melodic handled inside triggerNote
-      }, noteOnDelay + noteDurationMs);
+      }
     });
   }
 
-  // ─── Pending note-off cleanup ────────────────────────────────
-  function _processPendingNoteOffs() {
-    const now = audioCtx.currentTime;
-    const remaining = [];
-    pendingNoteOffs.forEach(item => {
-      if (now >= item.time) {
-        MidiManager.noteOff(item.channel, item.note);
-      } else {
-        remaining.push(item);
-      }
-    });
-    pendingNoteOffs.length = 0;
-    pendingNoteOffs.push(...remaining);
+  /** Schedule a MIDI note-off at a given (absolute) time. */
+  function _scheduleMidiNoteOff(ch, note, when, outputId) {
+    const ctx = _ctx();
+    if (!ctx) return;
+    const delay = Math.max(0, (when - ctx.currentTime) * 1000);
+    setTimeout(() => {
+      if (!state.isPlaying) return;
+      MidiManager.noteOff(ch, note, outputId);
+    }, delay);
   }
 
   // ─── Transport Controls ──────────────────────────────────────
   function play() {
     if (state.isPlaying) return;
-    _ensureAudioCtx();
+    // Make sure the audio engine exists — the transport is clocked by the
+    // AudioContext, so without it there is nothing to schedule against.
+    if (!_ctx() && window.AudioEngine) AudioEngine.init();
+    const ctx = _ctx();
+    if (!ctx) return;
     state.isPlaying = true;
     state.currentStep = -1;
-    nextNoteTime = audioCtx.currentTime;
+    state.playingStep = -1;
+    absStep = 0;
+    playStartTime = ctx.currentTime + 0.06;
+    nextNoteTime = playStartTime;
     schedulerTimer = setInterval(_scheduler, scheduleInterval);
     MidiManager.startClock(state.bpm);
-    if (onStateChange) onStateChange({ ...state });
+    _notify(false);
   }
 
   function stop() {
@@ -212,10 +297,11 @@ const Sequencer = (() => {
     MidiManager.stopClock();
     MidiManager.allNotesOff();
     if (window.AudioEngine) AudioEngine.allNotesOff();
-    pendingNoteOffs.length = 0;
+    heldMidiNotes.clear();
     state.currentStep = -1;
+    state.playingStep = -1;
     if (onStepChange) onStepChange(-1);
-    if (onStateChange) onStateChange({ ...state });
+    _notify(false);
   }
 
   function rewind() {
@@ -226,17 +312,25 @@ const Sequencer = (() => {
 
   function toggleRecord() {
     state.isRecording = !state.isRecording;
-    if (onStateChange) onStateChange({ ...state });
+    _notify(false);
   }
 
   // ─── BPM / Swing / Steps ────────────────────────────────────
   function setBpm(bpm) {
-    state.bpm = Math.max(40, Math.min(240, bpm));
+    const ctx = _ctx();
+    const old = state.bpm;
+    state.bpm = Math.max(40, Math.min(240, Math.round(bpm)));
+    // Re-anchor the grid so a tempo change does not jump the playhead.
+    if (ctx && state.isPlaying && old !== state.bpm) {
+      playStartTime = nextNoteTime - (absStep + 1) * _secondsPerStep() - _swingOffset(absStep + 1);
+    }
     MidiManager.updateClockBpm(state.bpm);
+    _notify(false);
   }
 
   function setSwing(swing) {
-    state.swing = Math.max(0, Math.min(100, swing));
+    state.swing = Math.max(0, Math.min(100, Math.round(swing)));
+    _notify(false);
   }
 
   function setStepCount(count) {
@@ -244,11 +338,20 @@ const Sequencer = (() => {
     // Pad or trim each track
     state.tracks.forEach(track => {
       while (track.steps.length < state.stepCount) {
-        track.steps.push({ active: false, note: 60, velocity: 100, gate: 0.5, probability: 100, accent: false, slide: false });
+        track.steps.push(_blankStep());
       }
-      track.steps = track.steps.slice(0, state.stepCount);
+      if (track.steps.length > state.stepCount) {
+        track.steps = track.steps.slice(0, state.stepCount);
+      }
     });
-    if (onStateChange) onStateChange({ ...state });
+    _notify(true);
+  }
+
+  function _blankStep() {
+    return {
+      active: false, note: 60, velocity: 100, gate: 0.5, probability: 100,
+      accent: false, slide: false, offset: 0, repeats: 1,
+    };
   }
 
   // ─── Tap Tempo ───────────────────────────────────────────────
@@ -269,7 +372,7 @@ const Sequencer = (() => {
 
   // ─── Track Management ────────────────────────────────────────
   function initTracks(trackDefs) {
-    state.tracks = trackDefs.map(def => ({
+    state.tracks = (trackDefs || []).map(def => ({
       name:         def.name         || 'Track',
       midiChannel:  def.midiChannel  || 1,
       muted:        def.muted        || false,
@@ -277,41 +380,49 @@ const Sequencer = (() => {
       volume:       def.volume !== undefined ? def.volume : 100,
       audioMode:    def.audioMode    || 'both',     // 'internal' | 'midi' | 'both'
       midiOutputId: def.midiOutputId || null,        // null = use selected output
+      role:         def.role         || null,        // generator role
       steps: (def.steps || []).map(s => ({
-        active:      s.active      || false,
+        active:      !!s.active,
         note:        s.note        ?? 60,
         velocity:    s.velocity    ?? 100,
         gate:        s.gate        ?? 0.5,
         probability: s.probability ?? 100,
-        accent:      s.accent      || false,
-        slide:       s.slide       || false,
+        accent:      !!s.accent,
+        slide:       !!s.slide,
+        offset:      s.offset      ?? 0,
+        repeats:     s.repeats     ?? 1,
       })),
     }));
     // Pad to stepCount
     state.tracks.forEach(track => {
       while (track.steps.length < state.stepCount) {
-        track.steps.push({ active: false, note: 60, velocity: 100, gate: 0.5, probability: 100, accent: false, slide: false });
+        track.steps.push(_blankStep());
       }
     });
-    if (onStateChange) onStateChange({ ...state });
+    _notify(true);
   }
 
   function setTrackProperty(trackIdx, prop, value) {
     if (!state.tracks[trackIdx]) return;
+    saveUndo();
     state.tracks[trackIdx][prop] = value;
+    _notify(true);
   }
 
   function toggleStep(trackIdx, stepIdx) {
-    saveUndo();
     const step = state.tracks[trackIdx]?.steps[stepIdx];
     if (!step) return;
+    saveUndo();
     step.active = !step.active;
+    _notify(false);
   }
 
-  function setStepData(trackIdx, stepIdx, data) {
+  function setStepData(trackIdx, stepIdx, data, opts = {}) {
     const step = state.tracks[trackIdx]?.steps[stepIdx];
     if (!step) return;
+    if (!opts.noUndo) saveUndo();
     Object.assign(step, data);
+    if (onStateChange && !opts.silent) onStateChange({ ...state });
   }
 
   function getStep(trackIdx, stepIdx) {
@@ -322,669 +433,101 @@ const Sequencer = (() => {
     if (!state.tracks[trackIdx]) return;
     state.tracks[trackIdx].steps.forEach(s => {
       s.active = false; s.probability = 100; s.velocity = 100; s.gate = 0.5;
-      s.accent = false; s.slide = false;
+      s.accent = false; s.slide = false; s.offset = 0; s.repeats = 1;
     });
   }
 
   function clearAllTracks() {
     saveUndo();
     state.tracks.forEach((_, i) => clearTrack(i));
-    if (onStateChange) onStateChange({ ...state });
+    _notify(false);
   }
 
-  // ─── Scale & Root note definitions for Smart Randomizer ──────
-  const SCALES = {
-    minorPentatonic: [0, 3, 5, 7, 10],
-    naturalMinor: [0, 2, 3, 5, 7, 8, 10],
-    phrygian: [0, 1, 3, 5, 7, 8, 10],
-    dorian: [0, 2, 3, 5, 7, 9, 10],
-    major: [0, 2, 4, 5, 7, 9, 11]
-  };
-  const ROOT_NOTES = [48, 50, 52, 53, 55, 57]; // C2, D2, E2, F2, G2, A2
+  // ─── Generative engine integration ───────────────────────────
+  /**
+   * Apply a generator patch (from Generator.generate) to the sequencer.
+   */
+  function applyPatch(patch, opts = {}) {
+    if (!patch) return false;
+    if (!opts.noUndo) saveUndo();
 
-  function getRandomNoteFromScale(root, scale, octaveOffset) {
-    const scaleNote = scale[Math.floor(Math.random() * scale.length)];
-    return root + octaveOffset * 12 + scaleNote;
-  }
+    if (patch.bpm !== undefined) state.bpm = patch.bpm;
+    if (patch.swing !== undefined) state.swing = patch.swing;
+    if (patch.stepCount) state.stepCount = patch.stepCount;
 
-  function randomizeTrack(trackIdx) {
-    const track = state.tracks[trackIdx];
-    if (!track) return;
-    
-    // Clear track first
-    track.steps.forEach(s => {
-      s.active = false;
-      s.probability = 100;
-      s.velocity = 100;
-      s.gate = 0.5;
-    });
-
-    const name = track.name.toLowerCase();
-    const isKick = name.includes('kick') || trackIdx === 0;
-    const isSnare = name.includes('snare') || name.includes('clap') || trackIdx === 1;
-    const isHat = name.includes('hat') || name.includes('hh') || trackIdx === 2 || trackIdx === 3;
-    const isBass = name.includes('bass') || trackIdx === 4;
-    const isLead = name.includes('lead') || name.includes('synth') || name.includes('hook') || trackIdx === 5;
-    const isPad = name.includes('pad') || name.includes('chord') || trackIdx === 6;
-
-    const scale = SCALES.minorPentatonic;
-    const root = 60; // middle C
-
-    if (isKick) {
-      // 4-on-the-floor kick
-      [0, 4, 8, 12].forEach(stepIdx => {
-        track.steps[stepIdx].active = true;
-        track.steps[stepIdx].note = 36;
-        track.steps[stepIdx].velocity = 110 + Math.floor(Math.random() * 15);
-        track.steps[stepIdx].gate = 0.25;
-      });
-      if (Math.random() < 0.4) {
-        track.steps[14].active = true;
-        track.steps[14].note = 36;
-        track.steps[14].velocity = 70;
-        track.steps[14].gate = 0.1;
-      }
-    } else if (isSnare) {
-      [4, 12].forEach(stepIdx => {
-        track.steps[stepIdx].active = true;
-        track.steps[stepIdx].note = 38;
-        track.steps[stepIdx].velocity = 100 + Math.floor(Math.random() * 20);
-        track.steps[stepIdx].gate = 0.25;
-      });
-    } else if (isHat) {
-      const isOffbeat = Math.random() < 0.5;
-      if (isOffbeat) {
-        [2, 6, 10, 14].forEach(stepIdx => {
-          track.steps[stepIdx].active = true;
-          track.steps[stepIdx].note = 46;
-          track.steps[stepIdx].velocity = 80 + Math.floor(Math.random() * 15);
-          track.steps[stepIdx].gate = 0.35;
-        });
-      } else {
-        [0, 2, 4, 6, 8, 10, 12, 14].forEach(stepIdx => {
-          track.steps[stepIdx].active = true;
-          track.steps[stepIdx].note = 42;
-          track.steps[stepIdx].velocity = 60 + Math.floor(Math.random() * 30);
-          track.steps[stepIdx].gate = 0.1;
-        });
-      }
-    } else if (isBass) {
-      const bassRhythm = [2, 3, 6, 7, 10, 11, 14, 15];
-      const bassNotes = [root - 24, root - 24 + 3, root - 24 + 7];
-      bassRhythm.forEach(stepIdx => {
-        if (Math.random() < 0.75) {
-          track.steps[stepIdx].active = true;
-          track.steps[stepIdx].note = bassNotes[Math.floor(Math.random() * bassNotes.length)];
-          track.steps[stepIdx].velocity = 90 + Math.floor(Math.random() * 20);
-          track.steps[stepIdx].gate = 0.35;
-        }
-      });
-    } else if (isLead) {
-      const activeSteps = [0, 2, 3, 5, 8, 10, 11, 13].filter(() => Math.random() < 0.6);
-      activeSteps.forEach(stepIdx => {
-        track.steps[stepIdx].active = true;
-        track.steps[stepIdx].note = getRandomNoteFromScale(root, scale, 1);
-        track.steps[stepIdx].velocity = 80 + Math.floor(Math.random() * 25);
-        track.steps[stepIdx].gate = 0.25;
-      });
-    } else if (isPad) {
-      [0, 8].forEach((stepIdx, idx) => {
-        track.steps[stepIdx].active = true;
-        track.steps[stepIdx].note = root - 12 + scale[idx * 2 % scale.length];
-        track.steps[stepIdx].velocity = 70;
-        track.steps[stepIdx].gate = 0.85;
-      });
-    } else {
-      track.steps.forEach((step, stepIdx) => {
-        if (Math.random() < 0.2) {
-          step.active = true;
-          step.note = 36 + Math.floor(Math.random() * 12);
-          step.velocity = 60 + Math.floor(Math.random() * 20);
-          step.gate = 0.1;
-          step.probability = 70;
-        }
+    if (patch.tracks) {
+      state.tracks = patch.tracks.map((t, i) => {
+        const existing = state.tracks[i] || {};
+        const steps = t.steps.map(s => ({
+          active: !!s.active,
+          note: s.note ?? 60,
+          velocity: s.velocity ?? 100,
+          gate: s.gate ?? 0.5,
+          probability: s.probability ?? 100,
+          accent: !!s.accent,
+          slide: !!s.slide,
+          offset: s.offset ?? 0,
+          repeats: s.repeats ?? 1,
+        }));
+        while (steps.length < state.stepCount) steps.push(_blankStep());
+        return {
+          name: t.name || existing.name || `Track ${i + 1}`,
+          midiChannel: t.midiChannel ?? existing.midiChannel ?? 1,
+          muted: existing.muted ?? false,
+          soloed: existing.soloed ?? false,
+          volume: existing.volume ?? 100,
+          audioMode: existing.audioMode || 'both',
+          midiOutputId: existing.midiOutputId || null,
+          role: t.role || existing.role || null,
+          steps: steps.slice(0, state.stepCount),
+        };
       });
     }
-  }
 
-  // ─── Techno + Acid randomizer ─────────────────────────────
-  // Genre-aware: respects scale, preserves kick, adds accent/slide
-  function randomizeAll() {
-    saveUndo();
+    if (patch.meta) state.generative = { ...(state.generative || {}), ...patch.meta };
 
-    // Pick genre
-    const genre = Math.random() < 0.5 ? 'techno' : 'acid';
-
-    // ── Scale definitions ──────────────────────────────────────
-    // E Phrygian intervals from root E2(40): E F G A B C D
-    const TECHNO_ROOT  = 40; // E2
-    const TECHNO_SCALE = [0, 1, 3, 5, 7, 8, 10]; // Phrygian
-    // A minor intervals from root A2(45): A B C D E F G
-    const ACID_ROOT    = 45; // A2
-    const ACID_SCALE   = [0, 2, 3, 5, 7, 8, 10]; // Natural minor
-
-    const root = genre === 'techno' ? TECHNO_ROOT : ACID_ROOT;
-    const scale = genre === 'techno' ? TECHNO_SCALE : ACID_SCALE;
-
-    // Helper: pick a note from the genre scale in a given octave offset
-    function scaleNote(octaveOffset = 0) {
-      const interval = scale[Math.floor(Math.random() * scale.length)];
-      return root + interval + octaveOffset * 12;
-    }
-
-    // BPM / Swing
-    if (genre === 'techno') {
-      setBpm(133 + Math.floor(Math.random() * 8));
-      setSwing(0);
-    } else {
-      setBpm(138 + Math.floor(Math.random() * 8));
-      setSwing(0);
-    }
-
-    // Set instrument types
-    const instruments = genre === 'techno'
-      ? ['drum', 'drum', 'drum', 'drum', 'bass', 'lead', 'pad', 'drum']
-      : ['drum', 'drum', 'drum', 'drum', 'acid', 'acid', 'lead', 'pad'];
-    if (window.AudioEngine) {
-      instruments.forEach((type, i) => AudioEngine.setTrackInstrument(i, type));
+    // Apply the patch's instrument assignment.
+    if (patch.tracks && window.AudioEngine) {
+      patch.tracks.forEach((t, i) => {
+        if (t.instrument) AudioEngine.setTrackInstrument(i, t.instrument);
+      });
       if (window.UI && UI.renderInstruments) UI.renderInstruments();
     }
 
-    // Clear all tracks
-    state.tracks.forEach((_, i) => clearTrack(i));
-
-    state.tracks.forEach((track, i) => {
-      const steps = track.steps;
-
-      // ── Track 0: Kick — always 4-on-floor ──────────────────
-      if (i === 0) {
-        [0, 4, 8, 12].forEach(s => {
-          steps[s].active   = true;
-          steps[s].note     = 36;
-          steps[s].velocity = 115 + Math.floor(Math.random() * 10);
-          steps[s].gate     = 0.25;
-        });
-      }
-
-      // ── Track 1: Snare — beats 2 & 4 ──────────────────────
-      else if (i === 1) {
-        [4, 12].forEach(s => {
-          steps[s].active   = true;
-          steps[s].note     = 38;
-          steps[s].velocity = 100 + Math.floor(Math.random() * 15);
-          steps[s].gate     = 0.25;
-        });
-      }
-
-      // ── Track 2: Clap / HH Closed ─────────────────────────
-      else if (i === 2) {
-        if (genre === 'techno') {
-          // 8th note hats with velocity groove
-          [0, 2, 4, 6, 8, 10, 12, 14].forEach((s, idx) => {
-            steps[s].active   = true;
-            steps[s].note     = 42;
-            steps[s].velocity = idx % 2 === 0 ? 68 + Math.floor(Math.random() * 10) : 48 + Math.floor(Math.random() * 10);
-            steps[s].gate     = 0.08;
-          });
-        } else {
-          // Full 16th hats for acid
-          steps.forEach((s, idx) => {
-            s.active   = true;
-            s.note     = 42;
-            s.velocity = idx % 2 === 0 ? 68 + Math.floor(Math.random() * 8) : 44 + Math.floor(Math.random() * 8);
-            s.gate     = 0.06;
-          });
-        }
-      }
-
-      // ── Track 3: HH Open ──────────────────────────────────
-      else if (i === 3) {
-        if (genre === 'techno') {
-          // Sparse open hat — bar end or offbeat
-          const openSteps = Math.random() < 0.5 ? [14] : [6, 14];
-          openSteps.forEach(s => {
-            steps[s].active   = true;
-            steps[s].note     = 46;
-            steps[s].velocity = 75 + Math.floor(Math.random() * 15);
-            steps[s].gate     = 0.3;
-          });
-        } else {
-          // Off-beat open hats for acid
-          [7, 15].forEach(s => {
-            steps[s].active   = true;
-            steps[s].note     = 46;
-            steps[s].velocity = 72 + Math.floor(Math.random() * 12);
-            steps[s].gate     = 0.3;
-          });
-        }
-      }
-
-      // ── Track 4: Bass / 303 #1 ────────────────────────────
-      else if (i === 4) {
-        if (genre === 'techno') {
-          // Syncopated bass in E Phrygian — 3-5 notes per bar
-          const bassPool = [0, 2, 3, 5, 6, 8, 9, 10, 11, 13, 14];
-          const count = 3 + Math.floor(Math.random() * 3);
-          const picked = bassPool.sort(() => Math.random() - 0.5).slice(0, count).sort((a,b) => a-b);
-          // Ensure step 0 is always present (root on downbeat)
-          if (!picked.includes(0)) picked.unshift(0);
-          picked.forEach(s => {
-            steps[s].active   = true;
-            steps[s].note     = root + scale[Math.floor(Math.random() * scale.length)];
-            steps[s].velocity = 95 + Math.floor(Math.random() * 20);
-            steps[s].gate     = 0.35 + Math.random() * 0.2;
-          });
-        } else {
-          // Dense 303 acid pattern in A minor
-          // Generate a classic-feeling acid rhythm (7-11 steps out of 16)
-          const activeCount = 7 + Math.floor(Math.random() * 5);
-          const pool = Array.from({length: 16}, (_, k) => k);
-          const picked = pool.sort(() => Math.random() - 0.5).slice(0, activeCount).sort((a,b) => a-b);
-          if (!picked.includes(0)) picked[0] = 0;
-
-          // Track which steps are active for slide detection
-          picked.forEach(s => steps[s].active = true);
-
-          picked.forEach(s => {
-            steps[s].note     = root + scale[Math.floor(Math.random() * scale.length)];
-            steps[s].velocity = 85 + Math.floor(Math.random() * 25);
-            steps[s].gate     = 0.3 + Math.random() * 0.2;
-            // Accent on downbeats (0, 4, 8, 12)
-            steps[s].accent   = [0, 4, 8, 12].includes(s);
-            // Slide if next step is also active (consecutive pair)
-            steps[s].slide    = (s < 15) && steps[s + 1].active;
-          });
-        }
-      }
-
-      // ── Track 5: Lead / 303 #2 ────────────────────────────
-      else if (i === 5) {
-        if (genre === 'techno') {
-          // Sparse lead stabs — 2-3 notes only
-          const leadPool = [2, 5, 8, 10, 13];
-          const count = 1 + Math.floor(Math.random() * 3);
-          leadPool.sort(() => Math.random() - 0.5).slice(0, count).forEach(s => {
-            steps[s].active   = true;
-            steps[s].note     = scaleNote(1); // upper octave
-            steps[s].velocity = 80 + Math.floor(Math.random() * 20);
-            steps[s].gate     = 0.3;
-            steps[s].probability = 80;
-          });
-        } else {
-          // 303 counter-line — sparse offbeat, no consecutive steps
-          const offbeats = [2, 5, 7, 10, 12, 15];
-          const count = 3 + Math.floor(Math.random() * 3);
-          offbeats.sort(() => Math.random() - 0.5).slice(0, count).forEach(s => {
-            steps[s].active   = true;
-            steps[s].note     = root + scale[Math.floor(Math.random() * scale.length)];
-            steps[s].velocity = 80 + Math.floor(Math.random() * 20);
-            steps[s].gate     = 0.3;
-            steps[s].accent   = [0, 4, 8, 12].includes(s);
-            steps[s].slide    = false; // no slide on counter-line
-          });
-        }
-      }
-
-      // ── Track 6: Pad ──────────────────────────────────────
-      else if (i === 6) {
-        const padSteps = Math.random() < 0.5 ? [0] : [0, 8];
-        padSteps.forEach(s => {
-          steps[s].active   = true;
-          steps[s].note     = scaleNote(1);
-          steps[s].velocity = 65;
-          steps[s].gate     = 0.9;
-        });
-      }
-
-      // ── Track 7: Perc / FX ────────────────────────────────
-      else if (i === 7) {
-        if (genre === 'techno') {
-          // Sparse metallic percussion
-          const percPool = [1, 3, 5, 7, 9, 11, 13, 15];
-          const count = 2 + Math.floor(Math.random() * 3);
-          percPool.sort(() => Math.random() - 0.5).slice(0, count).forEach(s => {
-            steps[s].active      = true;
-            steps[s].note        = 37 + Math.floor(Math.random() * 3);
-            steps[s].velocity    = 55 + Math.floor(Math.random() * 20);
-            steps[s].gate        = 0.1;
-            steps[s].probability = 65;
-          });
-        } else {
-          // Pad for acid — sustained
-          steps[0].active   = true;
-          steps[0].note     = scaleNote(1);
-          steps[0].velocity = 60;
-          steps[0].gate     = 0.95;
-        }
-      }
-    });
-
-    if (onStateChange) onStateChange({ ...state });
+    _notify(true);
+    return true;
   }
 
-  // ─── Legacy single-track randomizer (unchanged) ───────────────
-  // (kept for backwards compatibility with per-track randomize buttons)
-  // Note: this old function is intentionally left below to avoid breaking
-  // any UI that calls randomizeTrack(). It will be removed in a future pass.
+  /** Generate a complete new pattern from the current generative params. */
+  function randomizeAll() {
+    if (!window.Generator) return false;
+    const params = state.generative || Generator.normaliseParams({ genre: 'techno' });
+    const patch = Generator.generate(params);
+    applyPatch(patch);
+    return true;
+  }
 
-  // Placeholder — the old randomizeAll starts here (replaced above)
-  // Ignore the dead code below until it is cleaned up:
-  if (false) {
-    const root = 60;
+  /** Regenerate a single track using its role. */
+  function randomizeTrack(trackIdx) {
+    if (!window.Generator) return false;
+    const track = state.tracks[trackIdx];
+    if (!track) return false;
+    saveUndo();
+    const params = state.generative || Generator.normaliseParams({ genre: 'techno' });
+    const steps = Generator.generateTrack(track.role || 'perc', params);
+    track.steps = steps.slice(0, state.stepCount);
+    _notify(true);
+    return true;
+  }
 
-    // Pick a random genre
-    const genres = ['techno', 'house', 'dnb', 'lofi'];
-    const genre = genres[Math.floor(Math.random() * genres.length)];
+  /** Update the generator parameters (without generating). */
+  function setGenerativeParams(params) {
+    state.generative = { ...(state.generative || {}), ...params };
+    _notify(false);
+  }
 
-    // Set BPM and Swing according to genre
-    let bpm, swing;
-    if (genre === 'techno') {
-      bpm = 130 + Math.floor(Math.random() * 8);
-      swing = Math.random() < 0.3 ? Math.floor(Math.random() * 10) : 0;
-    } else if (genre === 'house') {
-      bpm = 122 + Math.floor(Math.random() * 6);
-      swing = 20 + Math.floor(Math.random() * 20);
-    } else if (genre === 'dnb') {
-      bpm = 170 + Math.floor(Math.random() * 6);
-      swing = Math.floor(Math.random() * 10);
-    } else { // lofi
-      bpm = 80 + Math.floor(Math.random() * 12);
-      swing = 40 + Math.floor(Math.random() * 20);
-    }
-
-    setBpm(bpm);
-    setSwing(swing);
-
-    // Instrument assignments per genre
-    const genreInstruments = {
-      techno: ['bd', 'sn', 'hh', 'hh', 'bass', 'arpy', 'casio', 'industrial'],
-      house: ['808bd', 'cp', 'hh', 'hh', 'bass3', 'arpy', 'casio', 'bubble'],
-      dnb: ['amencutup', 'sn', 'hh', 'industrial', 'bass', 'sid', 'arpy', 'kurt'],
-      lofi: ['808bd', 'sn', 'hh', 'bottle', 'bass', 'casio', 'casio', 'birds']
-    };
-
-    const insts = genreInstruments[genre];
-    if (window.AudioEngine) {
-      insts.forEach((inst, i) => {
-        AudioEngine.setTrackInstrument(i, inst);
-      });
-      if (window.UI && UI.renderInstruments) {
-        UI.renderInstruments();
-      }
-    }
-
-    // Set Track Names for randomized tracks
-    const trackNames = {
-      techno: ['Kick', 'Snare', 'HH Closed', 'HH Open', 'Sub Bass', 'Lead Stab', 'Pad', 'Perc'],
-      house: ['Kick', 'Clap', 'HH Closed', 'HH Open', 'Walking Bass', 'Synth Hook', 'Chord Organ', 'Bubbles'],
-      dnb: ['Amen Break', 'Snare Layer', 'HiHat Sizzle', 'Metal Perc', 'Sub Bass', 'Chiptune Lead', 'Liquid Chords', 'Ambient FX'],
-      lofi: ['Dusty Kick', 'Crunch Snare', 'Swing Hat', 'Foley Perc', 'Jazz Bass', 'E-Piano Lead', 'Rhodes Pad', 'Birds Ambient']
-    };
-
-    const names = trackNames[genre];
-    state.tracks.forEach((track, i) => {
-      track.name = names[i];
-      const headerName = document.getElementById(`track-name-${i}`);
-      if (headerName) headerName.textContent = names[i];
-      const mixerName = document.getElementById(`mixer-name-${i}`);
-      if (mixerName) mixerName.textContent = names[i];
-    });
-
-    // Clear all steps first
-    clearAllTracks();
-
-    // Now build beautiful genre patterns!
-    state.tracks.forEach((track, i) => {
-      const steps = track.steps;
-      if (i === 0) { // Kick / Amen Break
-        if (genre === 'dnb') {
-          // Classic Amen Break slice pattern
-          const amenPattern = [
-            [0, 36, 110, 0.5],   // Kick slice
-            [1, 42, 70, 0.25],   // Hihat slice
-            [2, 42, 75, 0.25],   // Hihat slice
-            [3, 40, 85, 0.25],   // Ghost Snare
-            [4, 38, 115, 0.5],   // Snare slice
-            [5, 42, 70, 0.25],   // Hihat slice
-            [6, 42, 75, 0.25],   // Hihat slice
-            [7, 36, 90, 0.25],   // Ghost Kick
-            [8, 36, 110, 0.5],   // Kick slice
-            [9, 42, 70, 0.25],   // Hihat slice
-            [10, 36, 105, 0.5],  // Double Kick slice
-            [11, 42, 75, 0.25],  // Hihat slice
-            [12, 38, 118, 0.5],  // Snare slice
-            [13, 42, 70, 0.25],  // Hihat slice
-            [14, 40, 85, 0.25],  // Ghost Snare
-            [15, 42, 75, 0.25]   // Hihat slice
-          ];
-          amenPattern.forEach(([stepIdx, note, vel, gate]) => {
-            steps[stepIdx].active = true;
-            steps[stepIdx].note = note;
-            steps[stepIdx].velocity = vel;
-            steps[stepIdx].gate = gate;
-            steps[stepIdx].probability = 100;
-          });
-        } else if (genre === 'lofi') {
-          const lofiKicks = [0, 8];
-          if (Math.random() < 0.6) lofiKicks.push(10);
-          if (Math.random() < 0.4) lofiKicks.push(14);
-          lofiKicks.forEach(stepIdx => {
-            steps[stepIdx].active = true;
-            steps[stepIdx].note = 36;
-            steps[stepIdx].velocity = 100 + Math.floor(Math.random() * 20);
-            steps[stepIdx].gate = 0.25;
-            steps[stepIdx].probability = 100;
-          });
-        } else {
-          [0, 4, 8, 12].forEach(stepIdx => {
-            steps[stepIdx].active = true;
-            steps[stepIdx].note = 36;
-            steps[stepIdx].velocity = 115 + Math.floor(Math.random() * 12);
-            steps[stepIdx].gate = 0.25;
-            steps[stepIdx].probability = 100;
-          });
-          if (genre === 'house' && Math.random() < 0.5) {
-            steps[14].active = true;
-            steps[14].note = 36;
-            steps[14].velocity = 70;
-            steps[14].gate = 0.1;
-            steps[14].probability = 60;
-          }
-        }
-      }
-
-      else if (i === 1) { // Snare / Clap
-        if (genre !== 'dnb') {
-          [4, 12].forEach(stepIdx => {
-            steps[stepIdx].active = true;
-            steps[stepIdx].note = 38;
-            steps[stepIdx].velocity = 105 + Math.floor(Math.random() * 15);
-            steps[stepIdx].gate = 0.25;
-            steps[stepIdx].probability = 100;
-          });
-          if (genre === 'house' && Math.random() < 0.4) {
-            steps[15].active = true;
-            steps[15].note = 38;
-            steps[15].velocity = 60;
-            steps[15].gate = 0.1;
-            steps[15].probability = 50;
-          }
-        } else {
-          [4, 12].forEach(stepIdx => {
-            steps[stepIdx].active = true;
-            steps[stepIdx].note = 38;
-            steps[stepIdx].velocity = 100;
-            steps[stepIdx].gate = 0.25;
-          });
-        }
-      }
-
-      else if (i === 2) { // Hi-Hat Closed
-        if (genre === 'techno') {
-          steps.forEach((step, stepIdx) => {
-            if (stepIdx % 2 === 0) {
-              step.active = true;
-              step.note = 42;
-              step.velocity = 65 + (stepIdx % 4 === 2 ? 20 : 0) + Math.floor(Math.random() * 15);
-              step.gate = 0.1;
-              step.probability = 100;
-            } else if (Math.random() < 0.25) {
-              step.active = true;
-              step.note = 42;
-              step.velocity = 45 + Math.floor(Math.random() * 15);
-              step.gate = 0.05;
-              step.probability = 70;
-            }
-          });
-        } else if (genre === 'house' || genre === 'lofi') {
-          steps.forEach((step, stepIdx) => {
-            if (stepIdx % 2 === 0) {
-              step.active = Math.random() < 0.85;
-              step.note = 42;
-              step.velocity = 70 + Math.floor(Math.random() * 15);
-              step.gate = 0.1;
-            } else if (Math.random() < 0.4) {
-              step.active = true;
-              step.note = 42;
-              step.velocity = 45 + Math.floor(Math.random() * 15);
-              step.gate = 0.05;
-              step.probability = 75;
-            }
-          });
-        } else {
-          steps.forEach((step, stepIdx) => {
-            step.active = Math.random() < 0.75;
-            step.note = 42;
-            step.velocity = 50 + (stepIdx % 4 === 0 ? 30 : 0) + Math.floor(Math.random() * 15);
-            step.gate = 0.1;
-          });
-        }
-      }
-
-      else if (i === 3) { // Hi-Hat Open / Foley
-        if (genre === 'techno' || genre === 'house') {
-          [2, 6, 10, 14].forEach(stepIdx => {
-            steps[stepIdx].active = true;
-            steps[stepIdx].note = 46;
-            steps[stepIdx].velocity = 80 + Math.floor(Math.random() * 15);
-            steps[stepIdx].gate = genre === 'house' ? 0.5 : 0.3;
-            steps[stepIdx].probability = 100;
-          });
-        } else if (genre === 'lofi') {
-          steps.forEach((step, stepIdx) => {
-            if (Math.random() < 0.2) {
-              step.active = true;
-              step.note = 36 + Math.floor(Math.random() * 12);
-              step.velocity = 50 + Math.floor(Math.random() * 25);
-              step.gate = 0.15;
-              step.probability = 60;
-            }
-          });
-        } else {
-          [2, 6, 10, 14].forEach(stepIdx => {
-            if (Math.random() < 0.6) {
-              steps[stepIdx].active = true;
-              steps[stepIdx].note = 39;
-              steps[stepIdx].velocity = 60;
-              steps[stepIdx].gate = 0.2;
-            }
-          });
-        }
-      }
-
-      else if (i === 4) { // Bass
-        const bassRhythm = {
-          techno: [0, 2, 4, 6, 8, 10, 12, 14],
-          house: [2, 3, 6, 7, 10, 11, 14, 15],
-          dnb: [0, 3, 6, 8, 11, 14],
-          lofi: [0, 4, 8, 12]
-        };
-        const rhythm = bassRhythm[genre];
-        const bassNotes = [root - 24, root - 24 + scale[2 % scale.length], root - 24 + scale[4 % scale.length], root - 12];
-
-        rhythm.forEach(stepIdx => {
-          if (Math.random() < 0.85) {
-            steps[stepIdx].active = true;
-            steps[stepIdx].note = bassNotes[Math.floor(Math.random() * bassNotes.length)];
-            steps[stepIdx].velocity = 95 + Math.floor(Math.random() * 20);
-            steps[stepIdx].gate = genre === 'dnb' ? 0.75 : 0.4;
-            steps[stepIdx].probability = 90;
-          }
-        });
-      }
-
-      else if (i === 5) { // Lead
-        const motifRhythm = [];
-        for (let s = 0; s < 8; s++) {
-          if (s % 2 === 1 && Math.random() < 0.4) motifRhythm.push(s);
-          if (s % 3 === 0 && Math.random() < 0.5) motifRhythm.push(s);
-        }
-
-        const leadNotes1 = Array.from({length: 8}, () => getRandomNoteFromScale(root, scale, 1));
-        const leadNotes2 = Array.from({length: 8}, () => getRandomNoteFromScale(root, scale, 1));
-
-        steps.forEach((step, stepIdx) => {
-          const modStep = stepIdx % 8;
-          if (motifRhythm.includes(modStep)) {
-            const playChance = stepIdx < 8 ? 0.75 : 0.6;
-            if (Math.random() < playChance) {
-              step.active = true;
-              step.note = stepIdx < 8 ? leadNotes1[modStep] : leadNotes2[modStep];
-              step.velocity = 80 + Math.floor(Math.random() * 25);
-              step.gate = [0.25, 0.5][Math.floor(Math.random() * 2)];
-              step.probability = 80;
-            }
-          }
-        });
-      }
-
-      else if (i === 6) { // Pad
-        if (genre === 'lofi' || genre === 'house' || genre === 'dnb') {
-          const chordNotes = [root - 12 + scale[0], root - 12 + scale[2 % scale.length], root - 12 + scale[4 % scale.length]];
-          const padSteps = [0, 8];
-          padSteps.forEach((stepIdx, idx) => {
-            steps[stepIdx].active = true;
-            steps[stepIdx].note = chordNotes[idx % chordNotes.length];
-            steps[stepIdx].velocity = 70 + Math.floor(Math.random() * 15);
-            steps[stepIdx].gate = 0.85;
-            steps[stepIdx].probability = 100;
-          });
-        } else {
-          [2, 10, 14].forEach(stepIdx => {
-            if (Math.random() < 0.7) {
-              steps[stepIdx].active = true;
-              steps[stepIdx].note = root + scale[2 % scale.length];
-              steps[stepIdx].velocity = 75;
-              steps[stepIdx].gate = 0.25;
-              steps[stepIdx].probability = 80;
-            }
-          });
-        }
-      }
-
-      else if (i === 7) { // FX
-        if (genre === 'lofi') {
-          const birdStep = Math.floor(Math.random() * 16);
-          steps[birdStep].active = true;
-          steps[birdStep].note = 60 + Math.floor(Math.random() * 12);
-          steps[birdStep].velocity = 55;
-          steps[birdStep].gate = 0.75;
-          steps[birdStep].probability = 50;
-        } else {
-          steps.forEach((step, stepIdx) => {
-            if (Math.random() < 0.15) {
-              step.active = true;
-              step.note = 36 + Math.floor(Math.random() * 24);
-              step.velocity = 50 + Math.floor(Math.random() * 20);
-              step.gate = 0.1;
-              step.probability = 60;
-            }
-          });
-        }
-      }
-    });
-
-    if (onStateChange) onStateChange({ ...state });
+  function getGenerativeParams() {
+    return state.generative;
   }
 
   // ─── Apply Preset ────────────────────────────────────────────
@@ -1019,12 +562,13 @@ const Sequencer = (() => {
         delayTime: 0.36,
         delayFeedback: 0.30
       };
-      
+
       AudioEngine.setReverbMix(fx.reverbMix);
       AudioEngine.setReverbDecay(fx.reverbDecay);
       AudioEngine.setDelayMix(fx.delayMix);
       AudioEngine.setDelayTime(fx.delayTime);
       AudioEngine.setDelayFeedback(fx.delayFeedback);
+      if (fx.reverbTone !== undefined) AudioEngine.setReverbTone(fx.reverbTone);
 
       if (window.UI && UI.syncSpatialSliders) {
         UI.syncSpatialSliders(fx);
@@ -1038,26 +582,30 @@ const Sequencer = (() => {
   function toggleMute(trackIdx) {
     const t = state.tracks[trackIdx];
     if (!t) return;
+    saveUndo();
     t.muted = !t.muted;
     if (t.muted) {
-      MidiManager.allNotesOff();
+      // Release ONLY this track's notes — not the whole rig.
+      const ch = t.midiChannel || 1;
+      const held = heldMidiNotes.get(ch);
+      if (held !== undefined) {
+        MidiManager.noteOff(ch, held, t.midiOutputId);
+        heldMidiNotes.delete(ch);
+      }
+      MidiManager.noteOffChannel(ch, t.midiOutputId);
       if (window.AudioEngine) AudioEngine.allNotesOff();
     }
+    _notify(true);
   }
 
   function toggleSolo(trackIdx) {
     const t = state.tracks[trackIdx];
     if (!t) return;
-    const wasSoloed = t.soloed;
-    // Clear all solos
-    state.tracks.forEach(tr => { tr.soloed = false; tr.muted = false; });
-    if (!wasSoloed) {
-      t.soloed = true;
-      state.tracks.forEach((tr, i) => { if (i !== trackIdx) tr.muted = true; });
-    }
-    // Stop all currently playing notes so no soloed track keeps ringing
-    MidiManager.allNotesOff();
-    if (window.AudioEngine) AudioEngine.allNotesOff();
+    saveUndo();
+    // Solo is orthogonal to mute: clear the solo flags, keep the mutes.
+    state.tracks.forEach(tr => { tr.soloed = false; });
+    t.soloed = true;
+    _notify(true);
   }
 
   // ─── Getters ──────────────────────────────────────────
@@ -1065,10 +613,17 @@ const Sequencer = (() => {
   function getTracks() { return state.tracks; }
   function isPlaying() { return state.isPlaying; }
   function getCurrentStep() { return state.currentStep; }
+  function getPlayingStep() { return state.playingStep; }
   function canUndo() { return undoStack.length > 0; }
+  function canRedo() { return redoStack.length > 0; }
 
-  function barBeat() {
-    const s = Math.max(0, state.currentStep);
+  /**
+   * Bar : Beat : Step for a given step index.
+   * Uses the PLAYING step by default, so the transport clock matches the
+   * highlighted column.
+   */
+  function barBeat(stepIdx = null) {
+    const s = Math.max(0, stepIdx === null ? state.playingStep : stepIdx);
     const bar  = Math.floor(s / 16) + 1;
     const beat = Math.floor((s % 16) / 4) + 1;
     const step = (s % 4) + 1;
@@ -1079,17 +634,22 @@ const Sequencer = (() => {
   function setTrackAudioMode(trackIdx, mode) {
     // mode: 'internal' | 'midi' | 'both'
     if (!state.tracks[trackIdx]) return;
+    saveUndo();
     state.tracks[trackIdx].audioMode = mode;
+    _notify(true);
   }
 
   function setTrackMidiOutput(trackIdx, outputId) {
     if (!state.tracks[trackIdx]) return;
-    state.tracks[trackIdx].midiOutputId = outputId;
+    saveUndo();
+    state.tracks[trackIdx].midiOutputId = outputId || null;
+    _notify(true);
   }
 
   // ─── Callbacks ──────────────────────────────────────────────
   function setStepCallback(fn) { onStepChange = fn; }
   function setStateCallback(fn) { onStateChange = fn; }
+  function setTransportCallback(fn) { onTransportChange = fn; }
 
   return {
     play, stop, rewind, toggleRecord, tap,
@@ -1097,13 +657,14 @@ const Sequencer = (() => {
     initTracks, setTrackProperty,
     toggleStep, setStepData, getStep,
     clearTrack, clearAllTracks,
-    randomizeTrack, randomizeAll,
+    randomizeTrack, randomizeAll, applyPatch,
+    setGenerativeParams, getGenerativeParams,
     applyPreset,
     toggleMute, toggleSolo,
     setTrackAudioMode, setTrackMidiOutput,
-    getState, getTracks, isPlaying, getCurrentStep, barBeat,
-    setStepCallback, setStateCallback,
-    saveUndo, undo, canUndo,
+    getState, getTracks, isPlaying, getCurrentStep, getPlayingStep, barBeat,
+    setStepCallback, setStateCallback, setTransportCallback,
+    saveUndo, undo, redo, canUndo, canRedo,
   };
 
 })();
