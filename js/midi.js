@@ -28,6 +28,7 @@ const MidiManager = (() => {
   let onDeviceChange = null;   // callback → UI refresh
   let onMessage = null;        // callback → monitor
   let onExternalClock = null;  // callback → sequencer (slave mode)
+  let onCcActivity = null;     // callback → MIDI activity LED
 
   // ─── Device profiles ────────────────────────────────────────
   // `match`   : regex list used to identify the device by name
@@ -325,6 +326,9 @@ const MidiManager = (() => {
   function startClock(bpm) {
     stopClock();
     if (outputs.size === 0) return;
+    // In external (slave) mode the hardware is the master — we must not
+    // send a competing clock.
+    if (clockSource === 'external') return;
 
     clock.targets = _clockTargets();
     if (clock.targets.length === 0) return;
@@ -401,30 +405,52 @@ const MidiManager = (() => {
     running: false,
     pulses: 0,
     bpm: 120,
-    lastPulseTime: 0,
-    intervals: [],
+    lastPulseTime: 0,      // AudioContext time of the last pulse
+    intervals: [],         // recent pulse intervals (ms), for a stable BPM
+    started: false,
+    stopped: false,
+    continue: false,
   };
 
-  function getExternalClock() {
-    return { running: ext.running, pulses: ext.pulses, bpm: ext.bpm };
+  /**
+   * The AudioContext time of an incoming MIDI event.
+   * `e.timeStamp` is on the performance timeline, so we can convert it
+   * to the audio timeline and know exactly when the pulse happened —
+   * not when the scheduler happened to notice it.
+   */
+  function _eventAudioTime(e) {
+    const ctx = window.AudioEngine ? AudioEngine.getContext() : null;
+    const nowPerf = performance.now();
+    const delta = (typeof e.timeStamp === 'number' && e.timeStamp > 0)
+      ? (e.timeStamp - nowPerf) / 1000
+      : 0;
+    if (ctx) return ctx.currentTime + delta;
+    return nowPerf / 1000 + delta;
   }
 
-  function _handleExternalClock() {
-    const now = performance.now();
+  function getExternalClock() {
+    return {
+      running: ext.running,
+      pulses: ext.pulses,
+      bpm: ext.bpm,
+      lastPulseTime: ext.lastPulseTime,
+      pulseDuration: ext.bpm > 0 ? (60 / ext.bpm / 24) : 0,
+    };
+  }
+
+  function _handleExternalClock(e) {
+    const nowPerf = performance.now();
     if (ext.lastPulseTime > 0) {
-      const dt = now - ext.lastPulseTime;
+      const dt = nowPerf - ext.lastPulseTime;
       ext.intervals.push(dt);
-      if (ext.intervals.length > 24) ext.intervals.shift();
+      if (ext.intervals.length > 48) ext.intervals.shift();
       // 24 pulses per quarter note
       const avg = ext.intervals.reduce((a, b) => a + b, 0) / ext.intervals.length;
       if (avg > 0) ext.bpm = Math.max(20, Math.min(300, 60000 / avg / 24));
     }
-    ext.lastPulseTime = now;
+    ext.lastPulseTime = _eventAudioTime(e);
     ext.pulses++;
-    if (!ext.running) {
-      ext.running = true;
-      ext.pulses = 0;
-    }
+    ext.running = true;
     if (onExternalClock) onExternalClock(getExternalClock());
   }
 
@@ -433,6 +459,23 @@ const MidiManager = (() => {
     ext.lastPulseTime = 0;
     ext.intervals = [];
   }
+
+  // ─── Clock source: internal (master) or external (slave) ──────
+  let clockSource = 'internal';
+
+  function setClockSource(src) {
+    clockSource = (src === 'external') ? 'external' : 'internal';
+    if (clockSource === 'external') {
+      // Stop sending our own clock — the hardware is the master now.
+      stopClock();
+      resetExternalClock();
+    }
+    if (onClockSourceChange) onClockSourceChange(clockSource);
+  }
+
+  function getClockSource() { return clockSource; }
+  let onClockSourceChange = null;
+  function setClockSourceCallback(fn) { onClockSourceChange = fn; }
 
   // ─── All Notes Off ──────────────────────────────────────────
   function allNotesOff() {
@@ -453,18 +496,25 @@ const MidiManager = (() => {
     // 0xFC stop) arrive as status bytes with no data.
     if (status >= 0xF8) {
       if (status === 0xF8) {
-        _handleExternalClock();
+        _handleExternalClock(e);
         log('In: Clock', 'clock');
       } else if (status === 0xFA) {
         log('In: Start', 'clock');
+        ext.running = true;
+        ext.started = true;
+        ext.stopped = false;
         resetExternalClock();
-        if (onExternalClock) onExternalClock({ running: true, pulses: 0, bpm: ext.bpm, start: true });
+        if (onExternalClock) onExternalClock({ ...getExternalClock(), running: true, start: true });
       } else if (status === 0xFB) {
         log('In: Continue', 'clock');
+        ext.continue = true;
+        ext.running = true;
+        if (onExternalClock) onExternalClock({ ...getExternalClock(), running: true, cont: true });
       } else if (status === 0xFC) {
         log('In: Stop', 'clock');
         ext.running = false;
-        if (onExternalClock) onExternalClock({ running: false, pulses: ext.pulses, bpm: ext.bpm, stop: true });
+        ext.stopped = true;
+        if (onExternalClock) onExternalClock({ ...getExternalClock(), running: false, stop: true });
       }
       return;
     }
@@ -478,6 +528,12 @@ const MidiManager = (() => {
     } else if (type === 0xB0) {
       log(`In: CC ch${ch} #${note}=${velocity}`, 'cc');
       if (onMessage) onMessage({ type: 'cc', channel: ch, cc: note, value: velocity });
+      // MIDI Learn gets first refusal on every CC.
+      if (window.MidiLearn && MidiLearn.handleCC(ch, note, velocity)) {
+        if (onCcActivity) onCcActivity(ch, note, velocity);
+        return;
+      }
+      if (onCcActivity) onCcActivity(ch, note, velocity);
     } else if (type === 0xC0) {
       log(`In: Program ch${ch} → ${note}`, 'cc');
       if (onMessage) onMessage({ type: 'program', channel: ch, program: note });
@@ -534,6 +590,8 @@ const MidiManager = (() => {
   function setDeviceChangeCallback(fn) { onDeviceChange = fn; }
   function setMessageCallback(fn) { onMessage = fn; }
   function setExternalClockCallback(fn) { onExternalClock = fn; }
+  function setCcActivityCallback(fn) { onCcActivity = fn; }
+  function setClockSourceCallback(fn) { onClockSourceChange = fn; }
 
   function isConnected() { return midiAccess !== null && outputs.size > 0; }
 
@@ -568,6 +626,10 @@ const MidiManager = (() => {
     stopClock,
     updateClockBpm,
     getExternalClock,
+    setClockSource,
+    getClockSource,
+    setClockSourceCallback,
+    setCcActivityCallback,
     allNotesOff,
     setLogElement,
     clearLog,

@@ -105,6 +105,32 @@ const GEN_IDS = [
 const missingGen = GEN_IDS.filter(id => !htmlIds.has(id));
 ok('every generator control exists in the HTML', missingGen.length === 0, missingGen.join(', '));
 
+// ─── 6b. The MIDI controller layer must exist ──────────────────
+const MIDI_IDS = [
+  'clock-source', 'midi-learn-banner', 'midi-learn-text', 'midi-learn-cancel',
+  'midi-cc-led', 'synth-track', 'synth-params', 'synth-reset',
+  'synth-cutoff', 'synth-resonance', 'synth-env', 'synth-decay',
+  'synth-drive', 'synth-glide', 'synth-level', 'synth-tune',
+];
+const missingMidi = MIDI_IDS.filter(id => !htmlIds.has(id));
+ok('every MIDI controller element exists in the HTML', missingMidi.length === 0, missingMidi.join(', '));
+
+// Every synth slider must have a matching value readout.
+const synthParams = ['cutoff', 'resonance', 'env', 'decay', 'drive', 'glide', 'level', 'tune'];
+const missingVals = synthParams.filter(p => !htmlIds.has(`synth-${p}-val`));
+ok('every synth parameter has a value readout', missingVals.length === 0, missingVals.join(', '));
+
+// Learnable controls must declare data-learn.
+const learnables = [...html.matchAll(/<(input|select)[^>]*id="([^"]+)"[^>]*>/g)]
+  .filter(m => /data-learn/.test(m[0]));
+ok('at least 12 controls are MIDI-learnable', learnables.length >= 12, `got ${learnables.length}`);
+
+// The learn module must be loaded before the app that uses it.
+const learnIdx = scripts.indexOf('js/midilearn.js');
+ok('midilearn.js is loaded', learnIdx >= 0);
+ok('midilearn.js loads before app.js', learnIdx >= 0 && learnIdx < scripts.indexOf('js/app.js'));
+ok('midilearn.js loads after midi.js', learnIdx > scripts.indexOf('js/midi.js'));
+
 // ─── 7. The UI's GEN_PARAM_IDS list must match the HTML ─────────
 const uiSrc = fs.readFileSync(path.join(ROOT, 'js', 'ui.js'), 'utf8');
 const genParamBlock = uiSrc.match(/const GEN_PARAM_IDS = \[([\s\S]*?)\];/);
@@ -126,8 +152,13 @@ const CLASSES = [
   'generator-panel', 'gen-panel-head', 'gen-seed-wrap', 'gen-seed', 'gen-body',
   'gen-controls', 'gen-row', 'gen-val', 'gen-preview', 'gen-preview-label',
   'gen-preview-info', 'gen-preview-grid', 'gen-cell', 'gen-actions',
+  'gen-preview-row', 'gen-preview-row-label', 'gen-preview-cells',
+  'gen-subrow', 'gen-row-wide', 'gen-hint',
   'mixer-master', 'master-meter', 'master-meter-fill',
   'track-mode-select', 'track-out-select', 'device-selected',
+  'clock-source-block', 'midi-learn-banner', 'midi-learn-dot',
+  'midi-cc-led', 'learn-badge', 'synth-params', 'synth-row', 'synth-val',
+  'synth-track-select',
 ];
 const unstyled = CLASSES.filter(c => !css.includes(`.${c}`));
 ok('every new UI class has CSS', unstyled.length === 0, unstyled.join(', '));

@@ -26,6 +26,9 @@ function ok(name, cond, detail = '') {
   if (cond) passed++;
   else { failed++; failures.push(`${name}${detail ? ' — ' + detail : ''}`); }
 }
+function eq(name, a, b) {
+  ok(name, a === b, `expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
+}
 
 // ─── Locate a browser ───────────────────────────────────────────
 const CANDIDATES = [
@@ -209,6 +212,77 @@ ok('keyboard rendered 24 keys', keys === 24, `got ${keys}`);
 
 const instrRows = await q('.instr-row');
 ok('instrument panel rendered 8 rows', instrRows === 8, `got ${instrRows}`);
+
+// ─── MIDI controller layer ──────────────────────────────────────
+const clockOpts = await q('#clock-source option');
+ok('clock source selector populated', clockOpts === 2, `got ${clockOpts}`);
+
+const synthRows = await q('.synth-row');
+ok('synth parameter panel rendered 8 rows', synthRows === 8, `got ${synthRows}`);
+
+const learnBadges = await q('.learn-badge');
+ok('MIDI Learn badges were injected', learnBadges >= 12, `got ${learnBadges}`);
+
+// The synth panel must be bound to a track and reflect the engine state.
+const synthState = await evaluate(`(() => {
+  AudioEngine.setTrackParam(4, 'cutoff', 0.77);
+  UI.syncSynthPanel();
+  return {
+    slider: document.getElementById('synth-cutoff').value,
+    label: document.getElementById('synth-cutoff-val').textContent,
+    param: AudioEngine.getTrackParams(4).cutoff,
+  };
+})()`);
+eq('the synth slider follows the engine', synthState.slider, '77');
+eq('the synth readout follows the engine', synthState.label, '77%');
+ok('the engine holds the value', Math.abs(synthState.param - 0.77) < 1e-6);
+
+// MIDI Learn: learn a CC and check the control follows.
+const learnState = await evaluate(`(() => {
+  const el = document.getElementById('master-vol');
+  MidiLearn.beginLearn(el);
+  const armed = MidiLearn.isLearning();
+  const consumed = MidiLearn.handleCC(1, 7, 100);
+  return {
+    armed,
+    consumed,
+    learning: MidiLearn.isLearning(),
+    value: el.value,
+    mapped: MidiLearn.getMap()['master-vol'],
+  };
+})()`);
+ok('learn mode arms', learnState.armed === true);
+ok('the learning CC is consumed', learnState.consumed === true);
+ok('learn mode ends after the CC', learnState.learning === false);
+// CC 100 of 127 across a 0..100 range = 79.
+eq('the learned control follows the CC', learnState.value, '79');
+ok('the mapping records the CC', learnState.mapped && learnState.mapped.cc === 7);
+eq('the mapping records the channel', learnState.mapped.ch, 1);
+
+// The badge should now show the CC number.
+const badgeText = await evaluate(
+  `document.querySelector('#master-vol').parentNode.querySelector('.learn-badge').textContent`);
+ok('the badge shows the mapped CC', badgeText === 'CC7', `got "${badgeText}"`);
+
+// Clean up the mapping so the test is repeatable.
+await evaluate(`MidiLearn.unbind(document.getElementById('master-vol'))`);
+
+// The clock source must switch.
+const clockSwitch = await evaluate(`(() => {
+  const sel = document.getElementById('clock-source');
+  sel.value = 'external';
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  const ext = {
+    seq: Sequencer.getClockSource(),
+    midi: MidiManager.getClockSource(),
+  };
+  sel.value = 'internal';
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  return { ext, back: Sequencer.getClockSource() };
+})()`);
+eq('the sequencer follows the clock source', clockSwitch.ext.seq, 'external');
+eq('the MIDI layer follows the clock source', clockSwitch.ext.midi, 'external');
+eq('the clock source switches back', clockSwitch.back, 'internal');
 
 // The app must have booted.
 const booted = await evaluate('typeof window.Sequencer !== "undefined" && typeof window.Generator !== "undefined" && typeof window.UI !== "undefined"');

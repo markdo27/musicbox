@@ -27,7 +27,7 @@
 
       <div class="bpm-block">
         <label for="bpm-value">BPM</label>
-        <input type="number" id="bpm-value" value="132" min="40" max="240" />
+        <input type="number" id="bpm-value" data-learn="Tempo" value="132" min="40" max="240" />
         <div class="bpm-arrows">
           <button id="bpm-up" title="BPM up">▲</button>
           <button id="bpm-down" title="BPM down">▼</button>
@@ -37,7 +37,7 @@
 
       <div class="swing-block">
         <label for="swing-slider">SWING</label>
-        <input type="range" id="swing-slider" min="0" max="100" value="0" />
+        <input type="range" id="swing-slider" data-learn="Swing" min="0" max="100" value="0" />
         <span id="swing-value">0%</span>
       </div>
 
@@ -62,7 +62,7 @@
         </button>
         <div class="master-vol-block">
           <label for="master-vol">VOL</label>
-          <input type="range" id="master-vol" min="0" max="100" value="72" />
+          <input type="range" id="master-vol" data-learn="Master volume" min="0" max="100" value="72" />
         </div>
       </div>
     </div>
@@ -70,12 +70,19 @@
     <div class="header-right">
       <div class="midi-status" id="midi-status">
         <span class="midi-dot" id="midi-dot"></span>
+        <span class="midi-cc-led" id="midi-cc-led" title="MIDI CC activity"></span>
         <span id="midi-status-text">No MIDI</span>
+      </div>
+
+      <!-- MIDI Learn banner -->
+      <div class="midi-learn-banner" id="midi-learn-banner" hidden>
+        <span class="midi-learn-dot"></span>
+        <span id="midi-learn-text">Move a hardware control to map…</span>
+        <button class="btn-tiny" id="midi-learn-cancel" title="Cancel">✕</button>
       </div>
 
       <!-- Save Slots -->
       <div class="save-slots" id="save-slots">
-        <span class="slots-label">SLOTS</span>
         <button class="slot-btn" id="slot-btn-A" data-slot="A" title="Save/Load Slot A">A</button>
         <button class="slot-btn" id="slot-btn-B" data-slot="B" title="Save/Load Slot B">B</button>
         <button class="slot-btn" id="slot-btn-C" data-slot="C" title="Save/Load Slot C">C</button>
@@ -104,6 +111,16 @@
         <h2 class="panel-title">
           <span class="panel-icon">📡</span> MIDI DEVICES
         </h2>
+
+        <!-- Clock source: master (we drive) or slave (hardware drives) -->
+        <div class="clock-source-block">
+          <label for="clock-source">CLOCK</label>
+          <select id="clock-source" title="Who generates the MIDI clock">
+            <option value="internal" selected>Internal — MusicBox drives</option>
+            <option value="external">External — follow hardware</option>
+          </select>
+        </div>
+
         <p class="no-devices" id="no-devices-msg">Connect a MIDI device…</p>
         <div class="device-list" id="device-list">
           <!-- populated by JS -->
@@ -129,6 +146,16 @@
         <div class="preset-controls">
           <button class="btn-secondary" id="btn-randomize">🎲 Randomize</button>
           <button class="btn-secondary" id="btn-clear-all">🗑 Clear All</button>
+        </div>
+      </section>
+
+      <!-- Keyboard Visualizer -->
+      <section class="panel" id="panel-keyboard">
+        <h2 class="panel-title">
+          <span class="panel-icon">🎹</span> KEYBOARD
+        </h2>
+        <div class="keyboard-wrap" id="keyboard-wrap">
+          <!-- piano keys populated by JS -->
         </div>
       </section>
     </aside>
@@ -188,7 +215,7 @@
             </div>
             <div class="gen-row">
               <label for="gen-density">Density</label>
-              <input type="range" id="gen-density" min="0" max="100" value="50" />
+              <input type="range" id="gen-density" data-learn="Generator density" min="0" max="100" value="50" />
               <span class="gen-val" id="gen-density-val">50%</span>
             </div>
             <div class="gen-row gen-row-wide">
@@ -277,12 +304,12 @@
         <div class="spatial-fx-controls">
           <div class="fx-row">
             <span class="fx-label">Reverb Mix</span>
-            <input type="range" class="fx-slider" id="fx-reverb-mix" min="0" max="100" value="25" aria-label="Reverb mix" />
+            <input type="range" class="fx-slider" id="fx-reverb-mix" data-learn="Reverb mix" min="0" max="100" value="25" aria-label="Reverb mix" />
             <span class="fx-val" id="fx-reverb-mix-val">25%</span>
           </div>
           <div class="fx-row">
             <span class="fx-label">Reverb Space</span>
-            <input type="range" class="fx-slider" id="fx-reverb-decay" min="10" max="80" value="25" aria-label="Reverb decay" />
+            <input type="range" class="fx-slider" id="fx-reverb-decay" data-learn="Reverb decay" min="10" max="80" value="25" aria-label="Reverb decay" />
             <span class="fx-val" id="fx-reverb-decay-val">2.5s</span>
           </div>
           <div class="fx-row">
@@ -292,7 +319,7 @@
           </div>
           <div class="fx-row">
             <span class="fx-label">Delay Mix</span>
-            <input type="range" class="fx-slider" id="fx-delay-mix" min="0" max="100" value="20" aria-label="Delay mix" />
+            <input type="range" class="fx-slider" id="fx-delay-mix" data-learn="Delay mix" min="0" max="100" value="20" aria-label="Delay mix" />
             <span class="fx-val" id="fx-delay-mix-val">20%</span>
           </div>
           <div class="fx-row">
@@ -308,7 +335,7 @@
           </div>
           <div class="fx-row">
             <span class="fx-label">Delay Feedback</span>
-            <input type="range" class="fx-slider" id="fx-delay-feedback" min="0" max="95" value="45" aria-label="Delay feedback" />
+            <input type="range" class="fx-slider" id="fx-delay-feedback" data-learn="Delay feedback" min="0" max="95" value="45" aria-label="Delay feedback" />
             <span class="fx-val" id="fx-delay-feedback-val">45%</span>
           </div>
         </div>
@@ -334,14 +361,55 @@
         </div>
       </section>
 
-      <!-- Keyboard Visualizer -->
-      <section class="panel" id="panel-keyboard">
+      <!-- Synth parameters for the selected track -->
+      <section class="panel" id="panel-synth">
         <h2 class="panel-title">
-          <span class="panel-icon">🎹</span> KEYBOARD
+          <span class="panel-icon">⚙️</span> SYNTH
+          <select id="synth-track" class="synth-track-select" title="Track to edit"></select>
         </h2>
-        <div class="keyboard-wrap" id="keyboard-wrap">
-          <!-- piano keys populated by JS -->
+        <div class="synth-params" id="synth-params">
+          <div class="synth-row">
+            <label for="synth-cutoff">Cutoff</label>
+            <input type="range" id="synth-cutoff" min="0" max="100" value="50" data-learn="Cutoff" />
+            <span class="synth-val" id="synth-cutoff-val">50%</span>
+          </div>
+          <div class="synth-row">
+            <label for="synth-resonance">Reso</label>
+            <input type="range" id="synth-resonance" min="0" max="100" value="45" data-learn="Resonance" />
+            <span class="synth-val" id="synth-resonance-val">45%</span>
+          </div>
+          <div class="synth-row">
+            <label for="synth-env">Env</label>
+            <input type="range" id="synth-env" min="0" max="100" value="75" data-learn="Filter envelope" />
+            <span class="synth-val" id="synth-env-val">75%</span>
+          </div>
+          <div class="synth-row">
+            <label for="synth-decay">Decay</label>
+            <input type="range" id="synth-decay" min="0" max="100" value="35" data-learn="Filter decay" />
+            <span class="synth-val" id="synth-decay-val">35%</span>
+          </div>
+          <div class="synth-row">
+            <label for="synth-drive">Drive</label>
+            <input type="range" id="synth-drive" min="0" max="100" value="20" data-learn="Drive" />
+            <span class="synth-val" id="synth-drive-val">20%</span>
+          </div>
+          <div class="synth-row">
+            <label for="synth-glide">Glide</label>
+            <input type="range" id="synth-glide" min="0" max="100" value="30" data-learn="Portamento" />
+            <span class="synth-val" id="synth-glide-val">30%</span>
+          </div>
+          <div class="synth-row">
+            <label for="synth-level">Level</label>
+            <input type="range" id="synth-level" min="0" max="100" value="80" data-learn="Synth level" />
+            <span class="synth-val" id="synth-level-val">80%</span>
+          </div>
+          <div class="synth-row">
+            <label for="synth-tune">Tune</label>
+            <input type="range" id="synth-tune" min="-12" max="12" value="0" data-learn="Tune" />
+            <span class="synth-val" id="synth-tune-val">0</span>
+          </div>
         </div>
+        <button class="btn-secondary" id="synth-reset">Reset params</button>
       </section>
     </aside>
   </main>
@@ -448,6 +516,7 @@
   <script src="js/sampler.js"></script>
   <script src="js/audio.js"></script>
   <script src="js/midi.js"></script>
+  <script src="js/midilearn.js"></script>
   <script src="js/sequencer.js"></script>
   <script src="js/storage.js"></script>
   <script src="js/ui.js"></script>

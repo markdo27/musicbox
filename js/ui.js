@@ -486,7 +486,7 @@ const UI = (() => {
           <span class="mixer-track-name" id="mixer-name-${i}"></span>
           <div class="mixer-fader-wrap">
             <input type="range" class="mixer-fader" id="mixer-vol-${i}" min="0" max="100"
-              title="Volume" aria-label="Track volume" />
+              title="Volume" aria-label="${escHtml(track.name)} volume" data-learn="${escHtml(track.name)} volume" data-learn-track="${i}" />
             <div class="mixer-vu" id="mixer-vu-${i}"></div>
           </div>
           <span class="mixer-vol-val" id="mixer-vol-val-${i}"></span>
@@ -522,6 +522,9 @@ const UI = (() => {
     while (container.children.length > tracks.length) {
       container.lastChild.remove();
     }
+
+    // The mixer faders are learnable — decorate them once they exist.
+    if (window.MidiLearn) MidiLearn.decorate(container);
   }
 
   // ─── MIDI Device Panel ────────────────────────────────────────
@@ -1234,6 +1237,72 @@ const UI = (() => {
     }
   }
 
+  // ─── Synth parameter panel ───────────────────────────────────
+  // Per-track "front panel" for the internal engines. Each parameter is
+  // MIDI-learnable and, where the device profile supports it, pushed to
+  // the hardware as CC.
+  const SYNTH_PARAM_MAP = [
+    { key: 'cutoff',    id: 'synth-cutoff',    scale: 100, suffix: '%', cc: 'cutoff' },
+    { key: 'resonance', id: 'synth-resonance', scale: 100, suffix: '%', cc: 'resonance' },
+    { key: 'env',       id: 'synth-env',       scale: 100, suffix: '%', cc: 'envMod' },
+    { key: 'decay',     id: 'synth-decay',     scale: 100, suffix: '%', cc: 'decay' },
+    { key: 'drive',     id: 'synth-drive',     scale: 100, suffix: '%', cc: 'drive' },
+    { key: 'glide',     id: 'synth-glide',     scale: 100, suffix: '%', cc: 'glide' },
+    { key: 'level',     id: 'synth-level',     scale: 100, suffix: '%', cc: null },
+    { key: 'tune',      id: 'synth-tune',      scale: 1,   suffix: 'st', cc: null },
+  ];
+
+  let _synthTrackIdx = 4;   // the 303 track by default
+
+  function renderSynthPanel() {
+    const sel = document.getElementById('synth-track');
+    if (!sel) return;
+    const tracks = Sequencer.getState().tracks;
+
+    if (!sel.options.length) {
+      tracks.forEach((t, i) => {
+        const o = document.createElement('option');
+        o.value = String(i);
+        o.textContent = t.name;
+        sel.appendChild(o);
+      });
+      sel.value = String(_synthTrackIdx);
+      sel.addEventListener('change', () => {
+        _synthTrackIdx = parseInt(sel.value, 10) || 0;
+        syncSynthPanel();
+      });
+    } else {
+      // Keep the labels in sync with renamed tracks.
+      tracks.forEach((t, i) => {
+        const o = sel.options[i];
+        if (o) o.textContent = t.name;
+      });
+    }
+    syncSynthPanel();
+  }
+
+  function syncSynthPanel() {
+    const params = window.AudioEngine ? AudioEngine.getTrackParams(_synthTrackIdx) : null;
+    if (!params) return;
+    SYNTH_PARAM_MAP.forEach(m => {
+      const el = document.getElementById(m.id);
+      const lbl = document.getElementById(m.id + '-val');
+      if (!el) return;
+      const v = params[m.key];
+      if (document.activeElement !== el) el.value = String(Math.round(v * m.scale));
+      if (lbl) lbl.textContent = (m.key === 'tune' ? v : Math.round(v * m.scale)) + m.suffix;
+    });
+    if (window.MidiLearn) MidiLearn.decorate(document.getElementById('panel-synth'));
+  }
+
+  function getSynthTrackIdx() { return _synthTrackIdx; }
+  function setSynthTrackIdx(i) {
+    _synthTrackIdx = Math.max(0, i);
+    const sel = document.getElementById('synth-track');
+    if (sel) sel.value = String(_synthTrackIdx);
+    syncSynthPanel();
+  }
+
   // ─── Utility ──────────────────────────────────────────────────
   function escHtml(s) {
     if (s === null || s === undefined) return '';
@@ -1257,6 +1326,11 @@ const UI = (() => {
     openNotePicker,
     closeNotePicker,
     refreshStepBtn: _refreshStepBtn,
+    renderSynthPanel,
+    syncSynthPanel,
+    getSynthTrackIdx,
+    setSynthTrackIdx,
+    SYNTH_PARAM_MAP,
     TRACK_COLORS,
     syncSpatialSliders,
     getCurrentStepEditing: () => currentStepBeingEdited,
